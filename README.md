@@ -174,8 +174,32 @@ ebook-bilingual-combine merge \
 
 By default, chapter pairing is done by order after front matter and back matter
 have been cleaned away. If a specific book really does not preserve chapter
-order, you can still use the advanced config path and provide `chapter_pairs`
-manually.
+order, the tool will ask for chapter-pair anchors.
+
+You do not need to enter every pair one by one. You can enter just the start
+and end anchors of a continuous aligned block.
+
+Example:
+
+```text
+2=3,25=26
+```
+
+This means:
+
+- `Language A` chapter 2 matches `Language B` chapter 3
+- `Language A` chapter 25 matches `Language B` chapter 26
+- all chapters in between are expanded automatically in order
+
+So the tool will infer:
+
+- `3=4`
+- `4=5`
+- ...
+- `24=25`
+
+This is useful when one edition has extra prefaces or appendices before the
+main text.
 
 ## Cleanup Rules
 

@@ -1167,9 +1167,11 @@ def resolve_chapter_pairs(
 
     print()
     print(
-        "Enter chapter pairs as comma-separated A=B items in the output order you want."
+        "Enter chapter pairs as comma-separated A=B items in ascending order."
     )
-    print("Example: 4=1,5=2,6=3")
+    print("You can enter just a few anchors and the tool will expand the middle.")
+    print("Example: 2=3,25=26")
+    print("That means A2..A25 will be paired with B3..B26 in order.")
     raw = input("Chapter pairs: ").strip()
     pairs = parse_chapter_pairs(raw, book_a, book_b)
     config["chapter_pairs"] = pairs
@@ -1219,11 +1221,11 @@ def parse_chapter_pairs(raw: str, book_a: Book, book_b: Book) -> list[dict]:
     if not raw:
         raise AlignmentError("No chapter pairs were provided.")
 
+    anchors: list[tuple[int, int]] = []
     seen_a: set[int] = set()
     seen_b: set[int] = set()
-    pairs: list[dict] = []
 
-    for index, chunk in enumerate(raw.split(","), start=1):
+    for chunk in raw.split(","):
         chunk = chunk.strip()
         match = re.fullmatch(r"(\d+)\s*=\s*(\d+)", chunk)
         if match is None:
@@ -1242,10 +1244,36 @@ def parse_chapter_pairs(raw: str, book_a: Book, book_b: Book) -> list[dict]:
         if chapter_b_index < 1 or chapter_b_index > len(book_b.chapters):
             raise AlignmentError(f"Source B chapter index out of range: {chapter_b_index}")
 
-        chapter_a = book_a.chapters[chapter_a_index - 1]
-        chapter_b = book_b.chapters[chapter_b_index - 1]
         seen_a.add(chapter_a_index)
         seen_b.add(chapter_b_index)
+
+        if anchors and (
+            chapter_a_index <= anchors[-1][0] or chapter_b_index <= anchors[-1][1]
+        ):
+            raise AlignmentError("Chapter pair anchors must be strictly increasing.")
+        anchors.append((chapter_a_index, chapter_b_index))
+
+    expanded_pairs: list[tuple[int, int]] = []
+    for index, (chapter_a_index, chapter_b_index) in enumerate(anchors):
+        if index == 0:
+            expanded_pairs.append((chapter_a_index, chapter_b_index))
+            continue
+
+        prev_a, prev_b = anchors[index - 1]
+        gap_a = chapter_a_index - prev_a
+        gap_b = chapter_b_index - prev_b
+        if gap_a != gap_b:
+            raise AlignmentError(
+                "Anchor pairs must preserve the same chapter distance. "
+                "For example, 2=3,25=26 is valid, but 2=3,25=27 is not."
+            )
+        for offset in range(1, gap_a + 1):
+            expanded_pairs.append((prev_a + offset, prev_b + offset))
+
+    pairs: list[dict] = []
+    for index, (chapter_a_index, chapter_b_index) in enumerate(expanded_pairs, start=1):
+        chapter_a = book_a.chapters[chapter_a_index - 1]
+        chapter_b = book_b.chapters[chapter_b_index - 1]
         pairs.append(
             {
                 "id": f"chapter-{index:02d}",
