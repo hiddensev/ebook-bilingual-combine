@@ -42,6 +42,20 @@ MARKDOWN_OUTPUT_SUFFIXES = {".md", ".markdown"}
 
 DECORATIVE_SEPARATOR_RE = re.compile(r"^[\s\-\*=#_~·•●○◆◇※＊・—–…\.]+$")
 ISOLATED_REFERENCE_RE = re.compile(r"^(?:\[\d+\]|\(\d+\)|\d+)$")
+TRAILING_NOTE_HEADING_RE = re.compile(
+    r"^\s*[\[【〔(（]?\s*(?:注释|尾注|注|notes?|endnotes?)\s*[:：]?\s*[\]】〕)）]?\s*$",
+    re.IGNORECASE,
+)
+TRAILING_NOTE_PARAGRAPH_RE = re.compile(
+    r"^\s*(?:"
+    r"[\[【〔(（]\s*\d+\s*[\]】〕)）][\s.:：、]*"
+    r"|"
+    r"\d+\s*[\].．)、:：][\s]*"
+    r"|"
+    r"(?:注|注释)\s*[:：]"
+    r")",
+    re.IGNORECASE,
+)
 TEXT_CHAPTER_HEADING_RE = re.compile(
     r"^\s*(?:chapter|part|book)\b.*$|^\s*第[\d一二三四五六七八九十百千零〇两]+[章节卷部回篇].*$",
     re.IGNORECASE,
@@ -627,6 +641,44 @@ def classify_structural_noise(text: str) -> str | None:
     return None
 
 
+def is_note_heading_paragraph(text: str) -> bool:
+    return bool(TRAILING_NOTE_HEADING_RE.fullmatch(text))
+
+
+def is_note_content_paragraph(text: str) -> bool:
+    return bool(TRAILING_NOTE_PARAGRAPH_RE.match(text))
+
+
+def find_trailing_note_cutoff(paragraphs: list[Paragraph]) -> int | None:
+    if len(paragraphs) < 2:
+        return None
+
+    # Case 1: an explicit note heading like "注释" or "【注释】" appears near the end.
+    search_start = max(0, len(paragraphs) // 2)
+    for index in range(search_start, len(paragraphs) - 1):
+        if not is_note_heading_paragraph(paragraphs[index].text):
+            continue
+        tail = paragraphs[index + 1 :]
+        if tail and all(is_note_content_paragraph(paragraph.text) for paragraph in tail):
+            return index
+
+    # Case 2: the chapter ends with a contiguous run of numbered note paragraphs.
+    tail_start: int | None = None
+    for index in range(len(paragraphs) - 1, -1, -1):
+        if is_note_content_paragraph(paragraphs[index].text):
+            tail_start = index
+            continue
+        break
+
+    if tail_start is None:
+        return None
+
+    tail_length = len(paragraphs) - tail_start
+    if tail_length >= 2:
+        return tail_start
+    return None
+
+
 def find_trailing_backmatter_cutoff(
     chapter_title: str,
     paragraphs: list[Paragraph],
@@ -639,7 +691,7 @@ def find_trailing_backmatter_cutoff(
     for index in range(search_start, len(paragraphs)):
         if cleanup_rules.trailing_backmatter_marker_re.fullmatch(paragraphs[index].text):
             return index
-    return None
+    return find_trailing_note_cutoff(paragraphs)
 
 
 def normalize_paragraphs(
