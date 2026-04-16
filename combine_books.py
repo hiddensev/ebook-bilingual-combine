@@ -1169,7 +1169,26 @@ def resolve_chapter_pairs(
     if configured_pairs:
         validated = validate_chapter_pairs(book_a, book_b, configured_pairs)
         config["chapter_pairs"] = validated
-        return validated
+        if not interactive:
+            return validated
+
+        first_pair = validated[0]
+        last_pair = validated[-1]
+        first_a = book_a.chapters_by_href[first_pair["a_href"]].order
+        first_b = book_b.chapters_by_href[first_pair["b_href"]].order
+        last_a = book_a.chapters_by_href[last_pair["a_href"]].order
+        last_b = book_b.chapters_by_href[last_pair["b_href"]].order
+
+        print()
+        print("Saved chapter anchors were found in the existing config.")
+        print(f"  Start: {first_a}={first_b}")
+        print(f"  End: {last_a}={last_b}")
+        raw = input(
+            "Press Enter to reuse them, or type 'reset' to enter new anchors: "
+        ).strip().casefold()
+        if raw not in {"reset", "r", "new", "n"}:
+            return validated
+        config["chapter_pairs"] = []
 
     if not interactive:
         raise AlignmentError(
@@ -1202,8 +1221,8 @@ def resolve_chapter_pairs(
 
     print()
     print("Enter the start and end chapter anchors as A=B.")
-    print("Example start anchor: 3=2")
-    print("Example end anchor: 26=25")
+    print("Example start anchor: 4=2")
+    print("Example end anchor: 24=22")
     print("The tool will expand all chapters in between in order.")
     start_anchor = input("Starting chapter anchor (A=B): ").strip()
     end_anchor = input("Ending chapter anchor (A=B): ").strip()

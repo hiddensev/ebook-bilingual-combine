@@ -125,6 +125,7 @@ This starts interactive mode. The tool will ask:
 Then it will:
 
 - create a per-run alignment config automatically
+- if an old alignment config already exists, ask whether to reuse or reset the saved chapter anchors
 - try to merge the two books
 - tell you where the output file was written
 - ask you how the start and end chapters should be paired
@@ -212,7 +213,7 @@ and end anchors of a continuous aligned block.
 Example:
 
 ```text
-3=2,26=25
+4=2,24=22
 ```
 
 `2=3` and `02=03` are treated the same way. The leading zero is only for
@@ -220,16 +221,16 @@ display in the chapter list.
 
 This means:
 
-- `Language A` chapter 3 matches `Language B` chapter 2
-- `Language A` chapter 26 matches `Language B` chapter 25
+- `Language A` chapter 4 matches `Language B` chapter 2
+- `Language A` chapter 24 matches `Language B` chapter 22
 - all chapters in between are expanded automatically in order
 
 So the tool will infer:
 
-- `4=3`
-- `5=4`
+- `5=3`
+- `6=4`
 - ...
-- `25=24`
+- `23=21`
 
 This is useful when one edition has extra prefaces, author pages, chronologies,
 or appendices before or after the main text.
