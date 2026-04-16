@@ -23,6 +23,7 @@ DC_NS = "http://purl.org/dc/elements/1.1/"
 CONTAINER_NS = "urn:oasis:names:tc:opendocument:xmlns:container"
 EPUB_NS = "http://www.idpf.org/2007/ops"
 NCX_NS = "http://www.daisy.org/z3986/2005/ncx/"
+XML_NS = "http://www.w3.org/XML/1998/namespace"
 
 SOURCE_SUFFIXES = {
     ".epub",
@@ -538,13 +539,25 @@ def set_config_language_names(config: dict, language_a: str, language_b: str) ->
 
 def strip_namespaces(element: ET.Element) -> None:
     if "}" in element.tag:
-        element.tag = element.tag.split("}", 1)[1]
+        namespace, local_name = element.tag[1:].split("}", 1)
+        if namespace == EPUB_NS:
+            element.tag = f"epub:{local_name}"
+        elif namespace == XML_NS:
+            element.tag = f"xml:{local_name}"
+        else:
+            element.tag = local_name
 
     for attribute in list(element.attrib):
         if "}" not in attribute:
             continue
         value = element.attrib.pop(attribute)
-        element.attrib[attribute.split("}", 1)[1]] = value
+        namespace, local_name = attribute[1:].split("}", 1)
+        if namespace == EPUB_NS:
+            element.attrib[f"epub:{local_name}"] = value
+        elif namespace == XML_NS:
+            element.attrib[f"xml:{local_name}"] = value
+        else:
+            element.attrib[local_name] = value
 
     for child in element:
         strip_namespaces(child)
@@ -2138,7 +2151,7 @@ def build_merged_chapter_xhtml(
     return textwrap.dedent(
         f"""\
         <?xml version="1.0" encoding="utf-8"?>
-        <html xmlns="{XHTML_NS}" xml:lang="mul">
+        <html xmlns="{XHTML_NS}" xmlns:epub="{EPUB_NS}" xml:lang="mul">
           <head>
             <title>{xml_escape(chapter.title)}</title>
             <link rel="stylesheet" type="text/css" href="styles/main.css" />
