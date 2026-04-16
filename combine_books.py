@@ -1065,24 +1065,6 @@ def prompt_for_path(prompt_text: str) -> Path:
         return path
 
 
-def prompt_with_default(prompt_text: str, default: str) -> str:
-    raw = input(f"{prompt_text} [{default}]: ").strip()
-    return raw or default
-
-
-def prompt_yes_no(prompt_text: str, default: bool = True) -> bool:
-    suffix = "Y/n" if default else "y/N"
-    raw = input(f"{prompt_text} [{suffix}]: ").strip().lower()
-    if not raw:
-        return default
-    if raw in {"y", "yes"}:
-        return True
-    if raw in {"n", "no"}:
-        return False
-    print("  Please answer yes or no.")
-    return prompt_yes_no(prompt_text, default=default)
-
-
 def resolve_source_path(provided: Path | None, prompt_text: str) -> Path:
     if provided is not None:
         path = provided.expanduser()
@@ -1129,7 +1111,6 @@ def resolve_chapter_pairs(
     book_b: Book,
     config: dict,
     interactive: bool,
-    prefer_order_pairing: bool,
 ) -> list[dict]:
     configured_pairs = config.get("chapter_pairs", [])
     if configured_pairs:
@@ -1137,7 +1118,7 @@ def resolve_chapter_pairs(
         config["chapter_pairs"] = validated
         return validated
 
-    if prefer_order_pairing and len(book_a.chapters) == len(book_b.chapters):
+    if len(book_a.chapters) == len(book_b.chapters):
         pairs = []
         for index, (chapter_a, chapter_b) in enumerate(
             zip(book_a.chapters, book_b.chapters),
@@ -2259,7 +2240,6 @@ def merge_epubs(args: argparse.Namespace) -> int:
         book_b,
         config,
         interactive=not args.non_interactive,
-        prefer_order_pairing=getattr(args, "same_order", False),
     )
     save_config(args.config, config)
 
@@ -2342,17 +2322,13 @@ def init_config_command(args: argparse.Namespace) -> int:
 
 def interactive_wizard() -> int:
     print("Interactive mode")
-    print("The tool will ask for the two language names and the two source files.")
+    print("The tool will ask for the two source files.")
     print()
 
-    label_a = prompt_with_default("First language name", "Language A")
-    label_b = prompt_with_default("Second language name", "Language B")
-    source_a = resolve_source_path(None, f"Path to the {label_a} eBook file: ")
-    source_b = resolve_source_path(None, f"Path to the {label_b} eBook file: ")
-    same_order = prompt_yes_no(
-        "Do the two books use the same chapter order?",
-        default=True,
-    )
+    label_a = "Language A"
+    label_b = "Language B"
+    source_a = resolve_source_path(None, "Path to the Language A eBook file: ")
+    source_b = resolve_source_path(None, "Path to the Language B eBook file: ")
 
     output_stem = f"{sanitize_output_stem(source_a.stem)}-bilingual"
     output_path = Path.cwd() / f"{output_stem}.epub"
@@ -2376,7 +2352,6 @@ def interactive_wizard() -> int:
         title="",
         max_auto_span=4,
         non_interactive=False,
-        same_order=same_order,
     )
     return merge_epubs(args)
 
@@ -2487,11 +2462,6 @@ def build_parser() -> argparse.ArgumentParser:
             "Maximum paragraph block size considered by the automatic local aligner. "
             "Increase this if one paragraph sometimes maps to 5+ consecutive paragraphs."
         ),
-    )
-    merge_parser.add_argument(
-        "--same-order",
-        action="store_true",
-        help="Use chapter order as the default chapter pairing when both books have the same number of main chapters.",
     )
     merge_parser.add_argument(
         "--non-interactive",

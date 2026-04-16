@@ -90,10 +90,8 @@ ebook-bilingual-combine
 
 This starts interactive mode. The tool will ask:
 
-1. what the first language is called
-2. what the second language is called
-3. where the first eBook file is
-4. where the second eBook file is
+1. where the `Language A` eBook file is
+2. where the `Language B` eBook file is
 
 Then it will:
 
@@ -113,6 +111,8 @@ You do not need to create a config file first for normal usage.
 
 - the recommended mode
 - enters the interactive question-and-answer flow
+- treats the first input file as `Language A` and the second input file as `Language B`
+- assumes the cleaned main chapters stay in the same order by default
 - best for normal users
 
 `ebook-bilingual-combine inspect`
@@ -171,6 +171,11 @@ ebook-bilingual-combine merge \
 - aligns chapters by paragraph count when possible
 - if counts still differ, tries local paragraph-block alignment by length signals before asking for manual help
 - stores chapter pairings and manual alignments in a JSON config file
+
+By default, chapter pairing is done by order after front matter and back matter
+have been cleaned away. If a specific book really does not preserve chapter
+order, you can still use the advanced config path and provide `chapter_pairs`
+manually.
 
 ## Cleanup Rules
 
