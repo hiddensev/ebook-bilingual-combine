@@ -585,6 +585,30 @@ def paragraph_from_text(source_index: int, text: str) -> Paragraph:
 
 
 def extract_title_from_document(document: ET.Element, fallback: str) -> str:
+    body = document.find(f".//{html_qname('body')}")
+    if body is not None:
+        leading_headings: list[str] = []
+        for child in list(body):
+            tag = child.tag
+            if tag in {
+                html_qname("h1"),
+                html_qname("h2"),
+                html_qname("h3"),
+            }:
+                text = normalize_text("".join(child.itertext()))
+                if text:
+                    leading_headings.append(text)
+                continue
+            if leading_headings:
+                break
+            if normalize_text("".join(child.itertext())):
+                break
+
+        if leading_headings:
+            if len(leading_headings) == 1:
+                return leading_headings[0]
+            return ": ".join(leading_headings)
+
     for tag in ("h1", "h2", "h3", "title"):
         element = document.find(f".//{html_qname(tag)}")
         if element is None:
@@ -593,6 +617,92 @@ def extract_title_from_document(document: ET.Element, fallback: str) -> str:
         if text:
             return text
     return fallback
+
+
+def normalize_epub_href(base_dir: str, ref: str) -> str | None:
+    target = ref.split("#", 1)[0].strip()
+    if not target:
+        return None
+    return os.path.normpath(os.path.join(base_dir, target))
+
+
+def extract_nav_titles_from_nav_document(
+    document: ET.Element,
+    nav_dir: str,
+) -> dict[str, str]:
+    titles: dict[str, str] = {}
+    for nav in document.findall(f".//{html_qname('nav')}"):
+        nav_type = (
+            nav.attrib.get(f"{{{EPUB_NS}}}type")
+            or nav.attrib.get("type")
+            or ""
+        )
+        if "toc" not in nav_type.casefold():
+            continue
+        for anchor in nav.findall(f".//{html_qname('a')}"):
+            href = anchor.attrib.get("href", "")
+            normalized_href = normalize_epub_href(nav_dir, href)
+            if not normalized_href:
+                continue
+            text = normalize_text("".join(anchor.itertext()))
+            if text and normalized_href not in titles:
+                titles[normalized_href] = text
+    return titles
+
+
+def extract_nav_titles_from_ncx(document: ET.Element, nav_dir: str) -> dict[str, str]:
+    titles: dict[str, str] = {}
+    for nav_point in document.findall(f".//{{{NCX_NS}}}navPoint"):
+        label = nav_point.find(f"./{{{NCX_NS}}}navLabel/{{{NCX_NS}}}text")
+        content = nav_point.find(f"./{{{NCX_NS}}}content")
+        if label is None or content is None:
+            continue
+        href = content.attrib.get("src", "")
+        normalized_href = normalize_epub_href(nav_dir, href)
+        if not normalized_href:
+            continue
+        text = normalize_text("".join(label.itertext()))
+        if text and normalized_href not in titles:
+            titles[normalized_href] = text
+    return titles
+
+
+def extract_epub_navigation_titles(
+    archive: zipfile.ZipFile,
+    package: ET.Element,
+    opf_dir: str,
+) -> dict[str, str]:
+    ns = {"opf": OPF_NS}
+    titles: dict[str, str] = {}
+
+    for item in package.findall("opf:manifest/opf:item", ns):
+        href = item.attrib.get("href", "")
+        media_type = item.attrib.get("media-type", "")
+        full_path = normalize_epub_href(opf_dir, href)
+        if not full_path:
+            continue
+        nav_dir = os.path.dirname(full_path)
+
+        if "nav" in item.attrib.get("properties", "").split():
+            try:
+                document = ET.fromstring(archive.read(full_path))
+            except KeyError:
+                continue
+            titles.update(extract_nav_titles_from_nav_document(document, nav_dir))
+            continue
+
+        if media_type == "application/x-dtbncx+xml":
+            try:
+                document = ET.fromstring(archive.read(full_path))
+            except KeyError:
+                continue
+            for normalized_href, text in extract_nav_titles_from_ncx(
+                document,
+                nav_dir,
+            ).items():
+                titles.setdefault(normalized_href, text)
+
+    return titles
 
 
 def extract_xhtml_paragraphs(root: ET.Element) -> list[Paragraph]:
@@ -839,6 +949,7 @@ def load_epub_book(path: Path, cleanup_rules: CleanupRules) -> Book:
             for item in package.findall("opf:manifest/opf:item", ns)
         }
         spine = package.findall("opf:spine/opf:itemref", ns)
+        nav_titles = extract_epub_navigation_titles(archive, package, opf_dir)
 
         chapters: list[Chapter] = []
         skipped_chapters: list[SkippedChapter] = []
@@ -852,7 +963,10 @@ def load_epub_book(path: Path, cleanup_rules: CleanupRules) -> Book:
             href = os.path.normpath(os.path.join(opf_dir, item["href"]))
             document = ET.fromstring(archive.read(href))
             raw_paragraphs = extract_xhtml_paragraphs(document)
-            chapter_title = extract_title_from_document(document, Path(href).stem)
+            chapter_title = nav_titles.get(href) or extract_title_from_document(
+                document,
+                Path(href).stem,
+            )
             chapter = build_chapter(
                 order=len(chapters) + 1,
                 spine_order=spine_order,
@@ -1166,28 +1280,12 @@ def resolve_chapter_pairs(
     interactive: bool,
 ) -> list[dict]:
     configured_pairs = config.get("chapter_pairs", [])
-    if configured_pairs:
+    if configured_pairs and not interactive:
         validated = validate_chapter_pairs(book_a, book_b, configured_pairs)
         config["chapter_pairs"] = validated
-        if not interactive:
-            return validated
+        return validated
 
-        first_pair = validated[0]
-        last_pair = validated[-1]
-        first_a = book_a.chapters_by_href[first_pair["a_href"]].order
-        first_b = book_b.chapters_by_href[first_pair["b_href"]].order
-        last_a = book_a.chapters_by_href[last_pair["a_href"]].order
-        last_b = book_b.chapters_by_href[last_pair["b_href"]].order
-
-        print()
-        print("Saved chapter anchors were found in the existing config.")
-        print(f"  Start: {first_a}={first_b}")
-        print(f"  End: {last_a}={last_b}")
-        raw = input(
-            "Press Enter to reuse them, or type 'reset' to enter new anchors: "
-        ).strip().casefold()
-        if raw not in {"reset", "r", "new", "n"}:
-            return validated
+    if interactive and configured_pairs:
         config["chapter_pairs"] = []
 
     if not interactive:

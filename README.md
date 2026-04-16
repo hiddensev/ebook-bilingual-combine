@@ -125,10 +125,10 @@ This starts interactive mode. The tool will ask:
 Then it will:
 
 - create a per-run alignment config automatically
-- if an old alignment config already exists, ask whether to reuse or reset the saved chapter anchors
+- show both chapter lists
+- ask you for the start and end chapter anchors
 - try to merge the two books
 - tell you where the output file was written
-- ask you how the start and end chapters should be paired
 
 By default, interactive mode writes its output, alignment config, and working
 directory into the current directory.
@@ -196,11 +196,10 @@ ebook-bilingual-combine merge \
 
 - parses both books into chapters and paragraphs
 - removes obvious structural noise such as `***`, empty paragraphs, and isolated reference-only blocks
-- skips obvious non-main-content chapters such as contents, copyright pages, acknowledgments, story notes, and similar front/back matter
 - trims likely trailing afterword / translator material appended to the end of chapters
 - separates obvious trailing note blocks at chapter ends, such as a final `注释` heading followed by bracketed note paragraphs
 - keeps those trailing notes in the final output, but excludes them from paragraph matching
-- asks you for chapter-pair anchors first
+- shows both full chapter lists and asks you for the start and end chapter anchors
 - if counts still differ, tries local paragraph-block alignment by length signals and automatically adopts the suggested paragraph ranges
 - stores chapter pairings and paragraph alignments in a JSON config file
 
