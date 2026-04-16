@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "language_a_label": "Language A",
+  "language_b_label": "Language B",
+  "cleanup": {
+    "trailing_backmatter_markers_add": [],
+    "trailing_backmatter_markers_remove": [],
+    "backmatter_title_keywords_add": [],
+    "backmatter_title_keywords_remove": [],
+    "non_main_title_exact_add": [],
+    "non_main_title_exact_remove": [],
+    "non_main_title_prefixes_add": [],
+    "non_main_title_prefixes_remove": [],
+    "non_main_title_substrings_add": [],
+    "non_main_title_substrings_remove": [],
+    "epub_non_main_file_markers_add": [],
+    "epub_non_main_file_markers_remove": [],
+    "translator_credit_suffixes_add": [],
+    "translator_credit_suffixes_remove": []
+  },
+  "chapter_pairs": []
+}

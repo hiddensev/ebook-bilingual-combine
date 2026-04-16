@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ebook-bilingual-combine"
+version = "0.1.0"
+description = "Merge two editions of the same book into bilingual epub, markdown, or text output."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "hiddensev" }]
+license = { text = "Proprietary" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "License :: Other/Proprietary License",
+  "Operating System :: OS Independent"
+]
+
+[project.scripts]
+ebook-bilingual-combine = "combine_books:main"
+
+[tool.setuptools]
+py-modules = ["combine_books"]

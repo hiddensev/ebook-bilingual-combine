@@ -1,0 +1,162 @@
+# eBook Bilingual Combine
+
+Merge two editions of the same book into one bilingual output.
+
+Supported inputs:
+
+- `.epub`
+- `.txt`
+- `.md` / `.markdown`
+- `.html` / `.htm` / `.xhtml`
+
+Supported outputs:
+
+- `.epub`
+- `.md`
+- `.txt`
+
+No third-party runtime dependencies are required.
+
+## Install
+
+Recommended, from the repository root:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install .
+```
+
+Editable development install:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -e .
+```
+
+After installation, the command is:
+
+```bash
+ebook-bilingual-combine --help
+```
+
+## Quick Start
+
+1. Create a config file.
+
+```bash
+ebook-bilingual-combine init-config \
+  --config alignment-config.json \
+  --label-a English \
+  --label-b Chinese
+```
+
+2. Inspect the two sources after cleanup.
+
+```bash
+ebook-bilingual-combine inspect \
+  "/path/to/book-a.epub" \
+  "/path/to/book-b.epub" \
+  --config alignment-config.json
+```
+
+3. Merge them.
+
+```bash
+ebook-bilingual-combine merge \
+  "/path/to/book-a.epub" \
+  "/path/to/book-b.epub" \
+  --config alignment-config.json \
+  --output merged-bilingual.epub \
+  --work-dir merge-work
+```
+
+If you omit one or both source paths, the tool prompts for them.
+
+## How It Works
+
+- parses both books into chapters and paragraphs
+- removes obvious structural noise such as `***`, empty paragraphs, and isolated reference-only blocks
+- skips obvious non-main-content chapters such as contents, copyright pages, acknowledgments, story notes, and similar front/back matter
+- trims likely trailing afterword / translator material appended to the end of chapters
+- aligns chapters by paragraph count when possible
+- if counts still differ, tries local paragraph-block alignment by length signals before asking for manual help
+- stores chapter pairings and manual alignments in a JSON config file
+
+## Cleanup Rules
+
+Cleanup rules are configurable through the JSON config file. You can add or remove:
+
+- back matter markers
+- non-main-content title keywords
+- EPUB filename markers for front/back matter
+- translator-credit suffixes
+
+Start from [alignment-config.example.json](./alignment-config.example.json), or generate a fresh local config with `init-config`.
+
+Example:
+
+```json
+{
+  "cleanup": {
+    "trailing_backmatter_markers_add": ["出版后记"],
+    "backmatter_title_keywords_add": ["编者按"],
+    "non_main_title_exact_remove": ["序"]
+  }
+}
+```
+
+## Automatic Alignment
+
+When paragraph counts differ after cleanup, the tool keeps order fixed and tries local `N:M` matches up to `--max-auto-span`.
+
+Typical cases:
+
+- `1:1`
+- `1:2`
+- `2:1`
+- `2:2`
+- larger local blocks if you raise `--max-auto-span`
+
+The score uses simple length-related signals instead of embeddings:
+
+- meaningful character count
+- English word count
+- Chinese Han character count
+- sentence count
+- dialogue / speaker-label hints
+
+This is meant to catch common editorial differences such as one long paragraph on one side being split into several shorter dialogue paragraphs on the other side.
+
+## Manual Alignment
+
+If automatic alignment is still not confident enough, the tool writes a review file under `merge-work/review/` and prompts for manual ranges.
+
+Example input:
+
+```text
+1=1,2-3=2,4=3-4
+```
+
+This means:
+
+- paragraph 1 in source A matches paragraph 1 in source B
+- paragraphs 2 to 3 in source A match paragraph 2 in source B
+- paragraph 4 in source A matches paragraphs 3 to 4 in source B
+
+The ranges must cover both chapters completely, stay continuous, and remain in order.
+
+## Main Files
+
+- [combine_books.py](./combine_books.py): main CLI module
+- [alignment-config.example.json](./alignment-config.example.json): starter config example
+- [pyproject.toml](./pyproject.toml): packaging and console-script entry point
+
+## Development Notes
+
+Direct script usage still works if you do not want to install the package:
+
+```bash
+python3 combine_books.py --help
+```
