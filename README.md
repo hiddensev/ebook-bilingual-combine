@@ -19,26 +19,65 @@ No third-party runtime dependencies are required.
 
 ## Install
 
-Recommended, from the repository root:
+If you are not technical, follow these steps exactly.
+
+### Option A: Clone with Git
+
+1. Open Terminal.
+2. Run:
 
 ```bash
+cd ~
+git clone https://github.com/hiddensev/ebook-bilingual-combine.git
+cd ebook-bilingual-combine
 python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install .
 ```
 
-Editable development install:
+If you are on Windows PowerShell, use this instead of `source .venv/bin/activate`:
+
+```bash
+.venv\Scripts\Activate.ps1
+```
+
+After that, run:
+
+```bash
+ebook-bilingual-combine
+```
+
+### Option B: Download ZIP instead of using Git
+
+1. Open the GitHub page:
+
+   `https://github.com/hiddensev/ebook-bilingual-combine`
+
+2. Click `Code` -> `Download ZIP`.
+3. Unzip the folder.
+4. Open Terminal and enter that folder.
+5. Run:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python3 -m pip install -e .
+python3 -m pip install .
+ebook-bilingual-combine
 ```
 
-After installation, the command is:
+### Notes
+
+- Keep the terminal window open while using the tool.
+- If you close the terminal and come back later, go back into the folder and run:
 
 ```bash
-ebook-bilingual-combine --help
+source .venv/bin/activate
+```
+
+- Then start the tool again with:
+
+```bash
+ebook-bilingual-combine
 ```
 
 ## Quick Start
