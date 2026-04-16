@@ -141,7 +141,7 @@ You do not need to create a config file first for normal usage.
 - the recommended mode
 - enters the interactive question-and-answer flow
 - treats the first input file as `Language A` and the second input file as `Language B`
-- uses chapter order by default only when both sides already have the same chapter count
+- assumes the cleaned main chapters stay in the same order by default
 - best for normal users
 
 `ebook-bilingual-combine inspect`
@@ -195,7 +195,7 @@ ebook-bilingual-combine merge \
 
 - parses both books into chapters and paragraphs
 - removes obvious structural noise such as `***`, empty paragraphs, and isolated reference-only blocks
-- skips only obvious non-main-content chapters such as contents, copyright pages, acknowledgments, story notes, and similar front/back matter
+- skips obvious non-main-content chapters such as contents, copyright pages, acknowledgments, story notes, and similar front/back matter
 - trims likely trailing afterword / translator material appended to the end of chapters
 - separates obvious trailing note blocks at chapter ends, such as a final `注释` heading followed by bracketed note paragraphs
 - keeps those trailing notes in the final output, but excludes them from paragraph matching
@@ -203,12 +203,9 @@ ebook-bilingual-combine merge \
 - if counts still differ, tries local paragraph-block alignment by length signals before asking for manual help
 - stores chapter pairings and manual alignments in a JSON config file
 
-If both sides end up with the same number of chapters after obvious cleanup, the
-tool pairs chapters by order.
-
-If the chapter counts still differ, the tool does not try to guess where the
-main text begins or ends. Instead, it shows both chapter lists and asks you for
-chapter-pair anchors.
+By default, chapter pairing is done by order after front matter and back matter
+have been cleaned away. If a specific book really does not preserve chapter
+order, the tool will ask for chapter-pair anchors.
 
 You do not need to enter every pair one by one. You can enter just the start
 and end anchors of a continuous aligned block.
@@ -216,7 +213,7 @@ and end anchors of a continuous aligned block.
 Example:
 
 ```text
-3=2,26=25
+2=3,25=26
 ```
 
 `2=3` and `02=03` are treated the same way. The leading zero is only for
@@ -224,19 +221,19 @@ display in the chapter list.
 
 This means:
 
-- `Language A` chapter 3 matches `Language B` chapter 2
-- `Language A` chapter 26 matches `Language B` chapter 25
+- `Language A` chapter 2 matches `Language B` chapter 3
+- `Language A` chapter 25 matches `Language B` chapter 26
 - all chapters in between are expanded automatically in order
 
 So the tool will infer:
 
-- `4=3`
-- `5=4`
+- `3=4`
+- `4=5`
 - ...
-- `25=24`
+- `24=25`
 
-This is useful when one edition has extra prefaces, author pages, chronologies,
-or appendices before or after the main text.
+This is useful when one edition has extra prefaces or appendices before the
+main text.
 
 ## Cleanup Rules
 
