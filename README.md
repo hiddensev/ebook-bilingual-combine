@@ -80,6 +80,35 @@ source .venv/bin/activate
 ebook-bilingual-combine
 ```
 
+## How to Update
+
+If you installed from a Git clone:
+
+```bash
+cd ~/ebook-bilingual-combine
+git pull
+source .venv/bin/activate
+python3 -m pip install .
+```
+
+If you installed in editable mode before, this also works:
+
+```bash
+cd ~/ebook-bilingual-combine
+git pull
+source .venv/bin/activate
+python3 -m pip install -e .
+```
+
+If you installed from a ZIP download, download the latest ZIP again, unzip it,
+enter the new folder, and run:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install .
+```
+
 ## Quick Start
 
 The simplest usage is just:
@@ -184,6 +213,9 @@ Example:
 ```text
 2=3,25=26
 ```
+
+`2=3` and `02=03` are treated the same way. The leading zero is only for
+display in the chapter list.
 
 This means:
 
