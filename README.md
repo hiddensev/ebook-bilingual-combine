@@ -127,7 +127,7 @@ Then it will:
 - create a per-run alignment config automatically
 - try to merge the two books
 - tell you where the output file was written
-- ask you for help only if chapter pairing still needs manual input
+- ask you how the start and end chapters should be paired
 
 By default, interactive mode writes its output, alignment config, and working
 directory into the current directory.
@@ -141,7 +141,7 @@ You do not need to create a config file first for normal usage.
 - the recommended mode
 - enters the interactive question-and-answer flow
 - treats the first input file as `Language A` and the second input file as `Language B`
-- uses chapter order by default only when both sides already have the same chapter count
+- asks you for chapter-pair anchors before merging
 - best for normal users
 
 `ebook-bilingual-combine inspect`
@@ -199,16 +199,12 @@ ebook-bilingual-combine merge \
 - trims likely trailing afterword / translator material appended to the end of chapters
 - separates obvious trailing note blocks at chapter ends, such as a final `注释` heading followed by bracketed note paragraphs
 - keeps those trailing notes in the final output, but excludes them from paragraph matching
-- aligns chapters by paragraph count when possible
+- asks you for chapter-pair anchors first
 - if counts still differ, tries local paragraph-block alignment by length signals and automatically adopts the suggested paragraph ranges
 - stores chapter pairings and paragraph alignments in a JSON config file
 
-If both sides end up with the same number of chapters after obvious cleanup, the
-tool pairs chapters by order.
-
-If the chapter counts still differ, the tool does not try to guess where the
-main text begins or ends. Instead, it shows both chapter lists and asks you for
-chapter-pair anchors.
+The tool does not try to guess where the main text begins or ends. Instead, it
+shows both chapter lists and asks you for chapter-pair anchors.
 
 You do not need to enter every pair one by one. You can enter just the start
 and end anchors of a continuous aligned block.

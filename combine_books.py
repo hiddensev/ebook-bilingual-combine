@@ -853,22 +853,6 @@ def load_epub_book(path: Path, cleanup_rules: CleanupRules) -> Book:
             document = ET.fromstring(archive.read(href))
             raw_paragraphs = extract_xhtml_paragraphs(document)
             chapter_title = extract_title_from_document(document, Path(href).stem)
-            skip_reason = non_main_chapter_reason(
-                chapter_title,
-                cleanup_rules,
-                href=href,
-                paragraph_count=len(raw_paragraphs),
-                book_title=title or path.stem,
-            )
-            if skip_reason is not None:
-                skipped_chapters.append(
-                    SkippedChapter(
-                        href=href,
-                        title=chapter_title,
-                        reason=skip_reason,
-                    )
-                )
-                continue
             chapter = build_chapter(
                 order=len(chapters) + 1,
                 spine_order=spine_order,
@@ -972,22 +956,6 @@ def load_plain_text_book(
     chapters: list[Chapter] = []
     skipped_chapters: list[SkippedChapter] = []
     for index, (title, body) in enumerate(sections, start=1):
-        skip_reason = non_main_chapter_reason(
-            title,
-            cleanup_rules,
-            href=f"section-{index:02d}",
-            paragraph_count=len(split_plain_paragraphs(body)),
-            book_title=path.stem,
-        )
-        if skip_reason is not None:
-            skipped_chapters.append(
-                SkippedChapter(
-                    href=f"section-{index:02d}",
-                    title=title,
-                    reason=skip_reason,
-                )
-            )
-            continue
         raw_paragraphs = [
             paragraph_from_text(source_index, paragraph_text)
             for source_index, paragraph_text in enumerate(
@@ -1059,22 +1027,6 @@ def load_html_book(path: Path, cleanup_rules: CleanupRules) -> Book:
     chapters: list[Chapter] = []
     skipped_chapters: list[SkippedChapter] = []
     for index, (title, raw_paragraphs) in enumerate(sections, start=1):
-        skip_reason = non_main_chapter_reason(
-            title,
-            cleanup_rules,
-            href=f"section-{index:02d}",
-            paragraph_count=len(raw_paragraphs),
-            book_title=fallback_title,
-        )
-        if skip_reason is not None:
-            skipped_chapters.append(
-                SkippedChapter(
-                    href=f"section-{index:02d}",
-                    title=title,
-                    reason=skip_reason,
-                )
-            )
-            continue
         chapter = build_chapter(
             order=len(chapters) + 1,
             spine_order=index,
@@ -1219,24 +1171,6 @@ def resolve_chapter_pairs(
         config["chapter_pairs"] = validated
         return validated
 
-    if len(book_a.chapters) == len(book_b.chapters):
-        pairs = []
-        for index, (chapter_a, chapter_b) in enumerate(
-            zip(book_a.chapters, book_b.chapters),
-            start=1,
-        ):
-            pairs.append(
-                {
-                    "id": f"chapter-{index:02d}",
-                    "a_href": chapter_a.href,
-                    "b_href": chapter_b.href,
-                    "title": f"{chapter_a.title} / {chapter_b.title}",
-                }
-            )
-        config["chapter_pairs"] = pairs
-        print("Using chapter order as the default chapter pairing.")
-        return pairs
-
     if not interactive:
         raise AlignmentError(
             "No chapter pairs are defined in the config. Run interactively first or "
@@ -1245,7 +1179,7 @@ def resolve_chapter_pairs(
 
     print()
     print("Chapter pairing is not configured yet.")
-    print("Use the normalized chapter lists below to define the chapter mapping.")
+    print("Use the chapter lists below to define the matching range.")
     print()
     print("Source A chapters:")
     for chapter in book_a.chapters:
@@ -1267,13 +1201,13 @@ def resolve_chapter_pairs(
         )
 
     print()
-    print(
-        "Enter chapter pairs as comma-separated A=B items in ascending order."
-    )
-    print("You can enter just the first and last matching chapter anchors.")
-    print("Examples: 2=3,25=26 or 3=2,26=25")
-    print("The tool will expand the middle chapters in order.")
-    raw = input("Chapter pairs: ").strip()
+    print("Enter the start and end chapter anchors as A=B.")
+    print("Example start anchor: 3=2")
+    print("Example end anchor: 26=25")
+    print("The tool will expand all chapters in between in order.")
+    start_anchor = input("Starting chapter anchor (A=B): ").strip()
+    end_anchor = input("Ending chapter anchor (A=B): ").strip()
+    raw = f"{start_anchor},{end_anchor}"
     pairs = parse_chapter_pairs(raw, book_a, book_b)
     config["chapter_pairs"] = pairs
     return pairs
