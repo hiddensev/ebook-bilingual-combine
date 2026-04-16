@@ -197,7 +197,8 @@ ebook-bilingual-combine merge \
 - removes obvious structural noise such as `***`, empty paragraphs, and isolated reference-only blocks
 - skips obvious non-main-content chapters such as contents, copyright pages, acknowledgments, story notes, and similar front/back matter
 - trims likely trailing afterword / translator material appended to the end of chapters
-- trims obvious trailing note blocks at chapter ends, such as a final `注释` heading followed by bracketed note paragraphs
+- separates obvious trailing note blocks at chapter ends, such as a final `注释` heading followed by bracketed note paragraphs
+- keeps those trailing notes in the final output, but excludes them from paragraph matching
 - aligns chapters by paragraph count when possible
 - if counts still differ, tries local paragraph-block alignment by length signals before asking for manual help
 - stores chapter pairings and manual alignments in a JSON config file

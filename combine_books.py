@@ -12,7 +12,7 @@ import textwrap
 import uuid
 import xml.etree.ElementTree as ET
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from html import escape as html_escape
 from pathlib import Path
@@ -139,6 +139,7 @@ BACKMATTER_TITLE_KEYWORDS = [
 ]
 NON_MAIN_TITLE_EXACT = [
     "praise",
+    "about the book",
     "contents",
     "table of contents",
     "copyright",
@@ -199,6 +200,9 @@ NON_MAIN_TITLE_PREFIXES = [
 ]
 NON_MAIN_TITLE_SUBSTRINGS = [
     "ted chiang",
+    "年表",
+    "chronology",
+    "timeline",
 ]
 EPUB_NON_MAIN_FILE_MARKERS = [
     "titlepage.xhtml",
@@ -284,6 +288,13 @@ LATIN_WORD_RE = re.compile(r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*")
 CJK_CHAR_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 MEANINGFUL_CHAR_RE = re.compile(r"[A-Za-z0-9\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 SENTENCE_END_RE = re.compile(r"[.!?。！？]+")
+CHINESE_NUMBERED_CHAPTER_RE = re.compile(
+    r"^\s*第[\d一二三四五六七八九十百千零〇两]+[章节卷部回篇]\b"
+)
+CHAPTER_NUMBER_PREFIX_RE = re.compile(
+    r"^\s*(?:chapter|part|book)\s+(?:\d+|[ivxlcdm]+|[a-z][a-z -]*)\b",
+    re.IGNORECASE,
+)
 
 ET.register_namespace("", XHTML_NS)
 ET.register_namespace("epub", EPUB_NS)
@@ -311,6 +322,7 @@ class Chapter:
     href: str
     title: str
     paragraphs: list[Paragraph]
+    trailing_note_paragraphs: list[Paragraph]
     removed_paragraphs: list[RemovedParagraph]
 
     @property
@@ -356,6 +368,8 @@ class MergedChapter:
     index: int
     title: str
     segments: list[MergedSegment]
+    trailing_note_paragraphs_a: list[Paragraph]
+    trailing_note_paragraphs_b: list[Paragraph]
 
 
 @dataclass(frozen=True)
@@ -395,6 +409,57 @@ def html_qname(tag: str) -> str:
 
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
+
+
+def english_number_title_set() -> set[str]:
+    units = {
+        0: "zero",
+        1: "one",
+        2: "two",
+        3: "three",
+        4: "four",
+        5: "five",
+        6: "six",
+        7: "seven",
+        8: "eight",
+        9: "nine",
+        10: "ten",
+        11: "eleven",
+        12: "twelve",
+        13: "thirteen",
+        14: "fourteen",
+        15: "fifteen",
+        16: "sixteen",
+        17: "seventeen",
+        18: "eighteen",
+        19: "nineteen",
+    }
+    tens = {
+        20: "twenty",
+        30: "thirty",
+        40: "forty",
+        50: "fifty",
+        60: "sixty",
+        70: "seventy",
+        80: "eighty",
+        90: "ninety",
+    }
+    values: set[str] = set()
+    for number in range(1, 100):
+        if number < 20:
+            values.add(units[number])
+            continue
+        base = tens[(number // 10) * 10]
+        remainder = number % 10
+        if remainder == 0:
+            values.add(base)
+        else:
+            values.add(f"{base}-{units[remainder]}")
+            values.add(f"{base} {units[remainder]}")
+    return values
+
+
+ENGLISH_NUMBER_TITLES = english_number_title_set()
 
 
 def default_cleanup_config() -> dict:
@@ -630,6 +695,86 @@ def non_main_chapter_reason(
     return None
 
 
+def looks_like_numbered_chapter_title(title: str) -> bool:
+    normalized = normalize_text(title)
+    if not normalized:
+        return False
+    folded = normalized.casefold()
+    return (
+        bool(CHINESE_NUMBERED_CHAPTER_RE.match(normalized))
+        or bool(CHAPTER_NUMBER_PREFIX_RE.match(normalized))
+        or folded in ENGLISH_NUMBER_TITLES
+    )
+
+
+def infer_numbered_chapter_bounds(chapters: list[Chapter]) -> tuple[int, int] | None:
+    numbered_indexes = [
+        index for index, chapter in enumerate(chapters)
+        if looks_like_numbered_chapter_title(chapter.title)
+    ]
+    if len(numbered_indexes) < 3:
+        return None
+
+    start = numbered_indexes[0]
+    end = numbered_indexes[-1]
+    window = chapters[start : end + 1]
+    numbered_in_window = sum(
+        1 for chapter in window if looks_like_numbered_chapter_title(chapter.title)
+    )
+    density = numbered_in_window / max(1, len(window))
+    if density < 0.75:
+        return None
+    return start, end
+
+
+def is_short_edge_non_main_chapter(chapter: Chapter) -> bool:
+    return (
+        not looks_like_numbered_chapter_title(chapter.title)
+        and chapter.paragraph_count <= 20
+    )
+
+
+def postprocess_book_chapters(book: Book) -> Book:
+    bounds = infer_numbered_chapter_bounds(book.chapters)
+    if bounds is None:
+        return book
+
+    start, end = bounds
+    chapters = list(book.chapters)
+    kept: list[Chapter] = []
+    skipped = list(book.skipped_chapters)
+
+    for index, chapter in enumerate(chapters):
+        if index < start or index > end:
+            if is_short_edge_non_main_chapter(chapter):
+                skipped.append(
+                    SkippedChapter(
+                        href=chapter.href,
+                        title=chapter.title,
+                        reason="non_main_content",
+                    )
+                )
+                continue
+        kept.append(chapter)
+
+    if len(kept) == len(chapters):
+        return book
+
+    renumbered = [
+        replace(chapter, order=index)
+        for index, chapter in enumerate(kept, start=1)
+    ]
+    return Book(
+        path=book.path,
+        title=book.title,
+        creator=book.creator,
+        language=book.language,
+        source_format=book.source_format,
+        chapters=renumbered,
+        skipped_chapters=skipped,
+    )
+
+
 def classify_structural_noise(text: str) -> str | None:
     if not text:
         return "empty"
@@ -691,15 +836,16 @@ def find_trailing_backmatter_cutoff(
     for index in range(search_start, len(paragraphs)):
         if cleanup_rules.trailing_backmatter_marker_re.fullmatch(paragraphs[index].text):
             return index
-    return find_trailing_note_cutoff(paragraphs)
+    return None
 
 
 def normalize_paragraphs(
     chapter_title: str,
     raw_paragraphs: list[Paragraph],
     cleanup_rules: CleanupRules,
-) -> tuple[list[Paragraph], list[RemovedParagraph]]:
+) -> tuple[list[Paragraph], list[Paragraph], list[RemovedParagraph]]:
     kept: list[Paragraph] = []
+    trailing_notes: list[Paragraph] = []
     removed: list[RemovedParagraph] = []
 
     for paragraph in raw_paragraphs:
@@ -714,6 +860,11 @@ def normalize_paragraphs(
             )
             continue
         kept.append(paragraph)
+
+    note_cutoff = find_trailing_note_cutoff(kept)
+    if note_cutoff is not None:
+        trailing_notes = kept[note_cutoff:]
+        kept = kept[:note_cutoff]
 
     cutoff = find_trailing_backmatter_cutoff(chapter_title, kept, cleanup_rules)
     if cutoff is not None:
@@ -748,8 +899,19 @@ def normalize_paragraphs(
             )
         )
 
+    normalized_trailing_notes: list[Paragraph] = []
+    for index, paragraph in enumerate(trailing_notes, start=1):
+        normalized_trailing_notes.append(
+            Paragraph(
+                index=index,
+                source_index=paragraph.source_index,
+                html=paragraph.html,
+                text=paragraph.text,
+            )
+        )
+
     removed.sort(key=lambda item: item.source_index)
-    return normalized, removed
+    return normalized, normalized_trailing_notes, removed
 
 
 def build_chapter(
@@ -760,7 +922,11 @@ def build_chapter(
     raw_paragraphs: list[Paragraph],
     cleanup_rules: CleanupRules,
 ) -> Chapter | None:
-    paragraphs, removed = normalize_paragraphs(title, raw_paragraphs, cleanup_rules)
+    paragraphs, trailing_notes, removed = normalize_paragraphs(
+        title,
+        raw_paragraphs,
+        cleanup_rules,
+    )
     if not paragraphs:
         return None
     return Chapter(
@@ -769,6 +935,7 @@ def build_chapter(
         href=href,
         title=title,
         paragraphs=paragraphs,
+        trailing_note_paragraphs=trailing_notes,
         removed_paragraphs=removed,
     )
 
@@ -837,7 +1004,7 @@ def load_epub_book(path: Path, cleanup_rules: CleanupRules) -> Book:
             if chapter is not None:
                 chapters.append(chapter)
 
-    return Book(
+    return postprocess_book_chapters(Book(
         path=path,
         title=title or path.stem,
         creator=creator,
@@ -845,7 +1012,7 @@ def load_epub_book(path: Path, cleanup_rules: CleanupRules) -> Book:
         source_format="epub",
         chapters=chapters,
         skipped_chapters=skipped_chapters,
-    )
+    ))
 
 
 def split_plain_paragraphs(text: str) -> list[str]:
@@ -963,7 +1130,7 @@ def load_plain_text_book(
         if chapter is not None:
             chapters.append(chapter)
 
-    return Book(
+    return postprocess_book_chapters(Book(
         path=path,
         title=path.stem,
         creator="",
@@ -971,7 +1138,7 @@ def load_plain_text_book(
         source_format=source_format,
         chapters=chapters,
         skipped_chapters=skipped_chapters,
-    )
+    ))
 
 
 def load_html_book(path: Path, cleanup_rules: CleanupRules) -> Book:
@@ -1043,7 +1210,7 @@ def load_html_book(path: Path, cleanup_rules: CleanupRules) -> Book:
         if chapter is not None:
             chapters.append(chapter)
 
-    return Book(
+    return postprocess_book_chapters(Book(
         path=path,
         title=fallback_title,
         creator="",
@@ -1051,7 +1218,7 @@ def load_html_book(path: Path, cleanup_rules: CleanupRules) -> Book:
         source_format="html",
         chapters=chapters,
         skipped_chapters=skipped_chapters,
-    )
+    ))
 
 
 def load_book(path: Path, cleanup_rules: CleanupRules) -> Book:
@@ -1144,7 +1311,13 @@ def inspect_books(book_a: Book, book_b: Book) -> None:
         print("  Normalized chapters:")
         for chapter in book.chapters:
             removed = len(chapter.removed_paragraphs)
-            suffix = f", {removed} removed" if removed else ""
+            notes = len(chapter.trailing_note_paragraphs)
+            details: list[str] = []
+            if removed:
+                details.append(f"{removed} removed")
+            if notes:
+                details.append(f"{notes} trailing notes")
+            suffix = f", {', '.join(details)}" if details else ""
             print(
                 f"    {chapter.order:02d}. {chapter.title} "
                 f"({chapter.paragraph_count} kept{suffix}) [{chapter.href}]"
@@ -1156,6 +1329,120 @@ def inspect_books(book_a: Book, book_b: Book) -> None:
                     f"    - {chapter.title} [{chapter.reason}] [{chapter.href}]"
                 )
         print()
+
+
+def chapter_sentence_total(chapter: Chapter) -> int:
+    return sum(sentence_count_for_alignment(paragraph.text) for paragraph in chapter.paragraphs)
+
+
+def chapter_alignment_cost(chapter_a: Chapter, chapter_b: Chapter) -> float:
+    count_a = chapter_a.paragraph_count
+    count_b = chapter_b.paragraph_count
+    sentence_a = chapter_sentence_total(chapter_a)
+    sentence_b = chapter_sentence_total(chapter_b)
+
+    count_cost = abs(count_a - count_b) / max(20.0, float(max(count_a, count_b)))
+    sentence_cost = abs(sentence_a - sentence_b) / max(
+        12.0,
+        float(max(sentence_a, sentence_b)),
+    )
+    return 2.1 * count_cost + 0.9 * sentence_cost
+
+
+def auto_pair_chapters(
+    book_a: Book,
+    book_b: Book,
+) -> tuple[list[dict], list[Chapter], list[Chapter], float] | None:
+    count_a = len(book_a.chapters)
+    count_b = len(book_b.chapters)
+    if count_a == 0 or count_b == 0:
+        return None
+
+    skip_cost = 0.85
+    inf = float("inf")
+    dp = [[inf] * (count_b + 1) for _ in range(count_a + 1)]
+    back: list[list[tuple[str, int, int] | None]] = [
+        [None] * (count_b + 1) for _ in range(count_a + 1)
+    ]
+    dp[0][0] = 0.0
+
+    for index_a in range(count_a + 1):
+        for index_b in range(count_b + 1):
+            score = dp[index_a][index_b]
+            if not math.isfinite(score):
+                continue
+            if index_a < count_a and index_b < count_b:
+                match_cost = chapter_alignment_cost(
+                    book_a.chapters[index_a],
+                    book_b.chapters[index_b],
+                )
+                next_score = score + match_cost
+                if next_score < dp[index_a + 1][index_b + 1]:
+                    dp[index_a + 1][index_b + 1] = next_score
+                    back[index_a + 1][index_b + 1] = ("match", index_a, index_b)
+            if index_a < count_a:
+                next_score = score + skip_cost
+                if next_score < dp[index_a + 1][index_b]:
+                    dp[index_a + 1][index_b] = next_score
+                    back[index_a + 1][index_b] = ("skip_a", index_a, index_b)
+            if index_b < count_b:
+                next_score = score + skip_cost
+                if next_score < dp[index_a][index_b + 1]:
+                    dp[index_a][index_b + 1] = next_score
+                    back[index_a][index_b + 1] = ("skip_b", index_a, index_b)
+
+    if not math.isfinite(dp[count_a][count_b]):
+        return None
+
+    pair_indexes: list[tuple[int, int]] = []
+    unmatched_a_indexes: list[int] = []
+    unmatched_b_indexes: list[int] = []
+    cursor_a = count_a
+    cursor_b = count_b
+    while cursor_a > 0 or cursor_b > 0:
+        previous = back[cursor_a][cursor_b]
+        if previous is None:
+            return None
+        action, prev_a, prev_b = previous
+        if action == "match":
+            pair_indexes.append((prev_a + 1, prev_b + 1))
+        elif action == "skip_a":
+            unmatched_a_indexes.append(prev_a + 1)
+        elif action == "skip_b":
+            unmatched_b_indexes.append(prev_b + 1)
+        cursor_a = prev_a
+        cursor_b = prev_b
+
+    pair_indexes.reverse()
+    unmatched_a_indexes.reverse()
+    unmatched_b_indexes.reverse()
+
+    if not pair_indexes:
+        return None
+
+    pairs: list[dict] = []
+    match_costs: list[float] = []
+    for index, (chapter_a_index, chapter_b_index) in enumerate(pair_indexes, start=1):
+        chapter_a = book_a.chapters[chapter_a_index - 1]
+        chapter_b = book_b.chapters[chapter_b_index - 1]
+        pairs.append(
+            {
+                "id": f"chapter-{index:02d}",
+                "a_href": chapter_a.href,
+                "b_href": chapter_b.href,
+                "title": f"{chapter_a.title} / {chapter_b.title}",
+            }
+        )
+        match_costs.append(chapter_alignment_cost(chapter_a, chapter_b))
+
+    coverage = len(pair_indexes) / float(min(count_a, count_b))
+    average_cost = sum(match_costs) / len(match_costs)
+    if coverage < 0.7 or average_cost > 0.4:
+        return None
+
+    unmatched_a = [book_a.chapters[index - 1] for index in unmatched_a_indexes]
+    unmatched_b = [book_b.chapters[index - 1] for index in unmatched_b_indexes]
+    return pairs, unmatched_a, unmatched_b, average_cost
 
 
 def resolve_chapter_pairs(
@@ -1186,6 +1473,26 @@ def resolve_chapter_pairs(
             )
         config["chapter_pairs"] = pairs
         print("Using chapter order as the default chapter pairing.")
+        return pairs
+
+    auto_pairs = auto_pair_chapters(book_a, book_b)
+    if auto_pairs is not None:
+        pairs, unmatched_a, unmatched_b, average_cost = auto_pairs
+        config["chapter_pairs"] = pairs
+        print(
+            "Auto-paired chapters by chapter-length heuristic "
+            f"(avg chapter cost {average_cost:.3f})."
+        )
+        if unmatched_a:
+            print(
+                "  Unmatched Language A chapters: "
+                + ", ".join(f"{chapter.order:02d} {chapter.title}" for chapter in unmatched_a)
+            )
+        if unmatched_b:
+            print(
+                "  Unmatched Language B chapters: "
+                + ", ".join(f"{chapter.order:02d} {chapter.title}" for chapter in unmatched_b)
+            )
         return pairs
 
     if not interactive:
@@ -1774,7 +2081,7 @@ def dynamic_programming_auto_align_chapter(
 
 
 def auto_alignment_is_confident(result: AutoAlignmentResult) -> bool:
-    return result.average_cost <= 0.55 and result.max_segment_cost <= 3.0
+    return result.average_cost <= 0.55 and result.max_segment_cost <= 4.2
 
 
 def write_review_file(
@@ -1835,6 +2142,14 @@ def write_review_file(
                 f"- src {removed.source_index}: [{removed.reason}] {removed.text or '[EMPTY]'}"
             )
         lines.append("")
+    if chapter_a.trailing_note_paragraphs:
+        lines.append("Trailing notes excluded from paragraph matching but preserved in output:")
+        lines.append("")
+        for paragraph in chapter_a.trailing_note_paragraphs:
+            lines.append(
+                f"- src {paragraph.source_index}: {paragraph.text or '[EMPTY]'}"
+            )
+        lines.append("")
 
     for paragraph in chapter_a.paragraphs:
         lines.append(review_line(paragraph))
@@ -1856,6 +2171,14 @@ def write_review_file(
         for removed in chapter_b.removed_paragraphs:
             lines.append(
                 f"- src {removed.source_index}: [{removed.reason}] {removed.text or '[EMPTY]'}"
+            )
+        lines.append("")
+    if chapter_b.trailing_note_paragraphs:
+        lines.append("Trailing notes excluded from paragraph matching but preserved in output:")
+        lines.append("")
+        for paragraph in chapter_b.trailing_note_paragraphs:
+            lines.append(
+                f"- src {paragraph.source_index}: {paragraph.text or '[EMPTY]'}"
             )
         lines.append("")
 
@@ -2001,7 +2324,13 @@ def build_merged_chapter(
                 paragraphs_b=chapter_b.paragraphs[b_start - 1 : b_end],
             )
         )
-    return MergedChapter(index=index, title=pair["title"], segments=segments)
+    return MergedChapter(
+        index=index,
+        title=pair["title"],
+        segments=segments,
+        trailing_note_paragraphs_a=chapter_a.trailing_note_paragraphs,
+        trailing_note_paragraphs_b=chapter_b.trailing_note_paragraphs,
+    )
 
 
 def build_merged_chapter_xhtml(
@@ -2022,6 +2351,24 @@ def build_merged_chapter_xhtml(
                   <div class="lang-block lang-b">
                     <div class="lang-label">{xml_escape(label_b)}</div>
                     {''.join(paragraph.html for paragraph in segment.paragraphs_b)}
+                  </div>
+                </section>
+                """
+            ).strip()
+        )
+
+    if chapter.trailing_note_paragraphs_a or chapter.trailing_note_paragraphs_b:
+        blocks.append(
+            textwrap.dedent(
+                f"""\
+                <section class="pair pair-notes" id="chapter-{chapter.index:02d}-notes">
+                  <div class="lang-block lang-a">
+                    <div class="lang-label">{xml_escape(label_a)} Notes</div>
+                    {''.join(paragraph.html for paragraph in chapter.trailing_note_paragraphs_a)}
+                  </div>
+                  <div class="lang-block lang-b">
+                    <div class="lang-label">{xml_escape(label_b)} Notes</div>
+                    {''.join(paragraph.html for paragraph in chapter.trailing_note_paragraphs_b)}
                   </div>
                 </section>
                 """
@@ -2257,6 +2604,13 @@ def write_markdown_output(
             lines.extend([f"**{label_b}**", ""])
             for paragraph in segment.paragraphs_b:
                 lines.extend([paragraph.text, ""])
+        if chapter.trailing_note_paragraphs_a or chapter.trailing_note_paragraphs_b:
+            lines.extend(["### Trailing Notes", "", f"**{label_a}**", ""])
+            for paragraph in chapter.trailing_note_paragraphs_a:
+                lines.extend([paragraph.text, ""])
+            lines.extend([f"**{label_b}**", ""])
+            for paragraph in chapter.trailing_note_paragraphs_b:
+                lines.extend([paragraph.text, ""])
         lines.append("")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
@@ -2278,6 +2632,13 @@ def write_text_output(
                 lines.extend([paragraph.text, ""])
             lines.extend([f"[{label_b}]", ""])
             for paragraph in segment.paragraphs_b:
+                lines.extend([paragraph.text, ""])
+        if chapter.trailing_note_paragraphs_a or chapter.trailing_note_paragraphs_b:
+            lines.extend(["[Trailing Notes]", "", f"[{label_a}]", ""])
+            for paragraph in chapter.trailing_note_paragraphs_a:
+                lines.extend([paragraph.text, ""])
+            lines.extend([f"[{label_b}]", ""])
+            for paragraph in chapter.trailing_note_paragraphs_b:
                 lines.extend([paragraph.text, ""])
         lines.append("")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2430,7 +2791,7 @@ def interactive_wizard() -> int:
         label_a=label_a,
         label_b=label_b,
         title="",
-        max_auto_span=4,
+        max_auto_span=5,
         non_interactive=False,
     )
     return merge_epubs(args)
@@ -2537,7 +2898,7 @@ def build_parser() -> argparse.ArgumentParser:
     merge_parser.add_argument(
         "--max-auto-span",
         type=int,
-        default=4,
+        default=5,
         help=(
             "Maximum paragraph block size considered by the automatic local aligner. "
             "Increase this if one paragraph sometimes maps to 5+ consecutive paragraphs."
