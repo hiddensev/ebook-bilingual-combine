@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "language_a_label": "Language A",
-  "language_b_label": "Language B",
+  "language_a": "Language A",
+  "language_b": "Language B",
   "cleanup": {
     "trailing_backmatter_markers_add": [],
     "trailing_backmatter_markers_remove": [],

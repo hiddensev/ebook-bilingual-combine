@@ -491,11 +491,32 @@ def build_cleanup_rules(config: dict) -> CleanupRules:
 def default_config(label_a: str, label_b: str) -> dict:
     return {
         "version": 1,
-        "language_a_label": label_a,
-        "language_b_label": label_b,
+        "language_a": label_a,
+        "language_b": label_b,
         "cleanup": default_cleanup_config(),
         "chapter_pairs": [],
     }
+
+
+def get_config_language_names(config: dict) -> tuple[str, str]:
+    language_a = (
+        config.get("language_a")
+        or config.get("language_a_label")
+        or "Language A"
+    )
+    language_b = (
+        config.get("language_b")
+        or config.get("language_b_label")
+        or "Language B"
+    )
+    return str(language_a), str(language_b)
+
+
+def set_config_language_names(config: dict, language_a: str, language_b: str) -> None:
+    config["language_a"] = language_a
+    config["language_b"] = language_b
+    config.pop("language_a_label", None)
+    config.pop("language_b_label", None)
 
 
 def strip_namespaces(element: ET.Element) -> None:
@@ -1003,9 +1024,13 @@ def load_config(config_path: Path, label_a: str, label_b: str) -> dict:
     else:
         config = default_config(label_a, label_b)
     config.setdefault("version", 1)
-    config.setdefault("language_a_label", label_a)
-    config.setdefault("language_b_label", label_b)
     config.setdefault("chapter_pairs", [])
+    existing_a, existing_b = get_config_language_names(config)
+    set_config_language_names(
+        config,
+        existing_a if existing_a else label_a,
+        existing_b if existing_b else label_b,
+    )
     ensure_cleanup_config(config)
     return config
 
@@ -1040,6 +1065,24 @@ def prompt_for_path(prompt_text: str) -> Path:
         return path
 
 
+def prompt_with_default(prompt_text: str, default: str) -> str:
+    raw = input(f"{prompt_text} [{default}]: ").strip()
+    return raw or default
+
+
+def prompt_yes_no(prompt_text: str, default: bool = True) -> bool:
+    suffix = "Y/n" if default else "y/N"
+    raw = input(f"{prompt_text} [{suffix}]: ").strip().lower()
+    if not raw:
+        return default
+    if raw in {"y", "yes"}:
+        return True
+    if raw in {"n", "no"}:
+        return False
+    print("  Please answer yes or no.")
+    return prompt_yes_no(prompt_text, default=default)
+
+
 def resolve_source_path(provided: Path | None, prompt_text: str) -> Path:
     if provided is not None:
         path = provided.expanduser()
@@ -1049,6 +1092,12 @@ def resolve_source_path(provided: Path | None, prompt_text: str) -> Path:
             raise AlignmentError(f"Not a file: {path}")
         return path
     return prompt_for_path(prompt_text)
+
+
+def sanitize_output_stem(name: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9\u4e00-\u9fff]+", "-", name).strip("-")
+    sanitized = re.sub(r"-{2,}", "-", sanitized)
+    return (sanitized[:60] or "merged-bilingual").strip("-")
 
 
 def inspect_books(book_a: Book, book_b: Book) -> None:
@@ -1080,12 +1129,31 @@ def resolve_chapter_pairs(
     book_b: Book,
     config: dict,
     interactive: bool,
+    prefer_order_pairing: bool,
 ) -> list[dict]:
     configured_pairs = config.get("chapter_pairs", [])
     if configured_pairs:
         validated = validate_chapter_pairs(book_a, book_b, configured_pairs)
         config["chapter_pairs"] = validated
         return validated
+
+    if prefer_order_pairing and len(book_a.chapters) == len(book_b.chapters):
+        pairs = []
+        for index, (chapter_a, chapter_b) in enumerate(
+            zip(book_a.chapters, book_b.chapters),
+            start=1,
+        ):
+            pairs.append(
+                {
+                    "id": f"chapter-{index:02d}",
+                    "a_href": chapter_a.href,
+                    "b_href": chapter_b.href,
+                    "title": f"{chapter_a.title} / {chapter_b.title}",
+                }
+            )
+        config["chapter_pairs"] = pairs
+        print("Using chapter order as the default chapter pairing.")
+        return pairs
 
     if not interactive:
         raise AlignmentError(
@@ -2191,11 +2259,11 @@ def merge_epubs(args: argparse.Namespace) -> int:
         book_b,
         config,
         interactive=not args.non_interactive,
+        prefer_order_pairing=getattr(args, "same_order", False),
     )
     save_config(args.config, config)
 
-    label_a = config["language_a_label"]
-    label_b = config["language_b_label"]
+    label_a, label_b = get_config_language_names(config)
     work_dir = args.work_dir
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2272,11 +2340,53 @@ def init_config_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def interactive_wizard() -> int:
+    print("Interactive mode")
+    print("The tool will ask for the two language names and the two source files.")
+    print()
+
+    label_a = prompt_with_default("First language name", "Language A")
+    label_b = prompt_with_default("Second language name", "Language B")
+    source_a = resolve_source_path(None, f"Path to the {label_a} eBook file: ")
+    source_b = resolve_source_path(None, f"Path to the {label_b} eBook file: ")
+    same_order = prompt_yes_no(
+        "Do the two books use the same chapter order?",
+        default=True,
+    )
+
+    output_stem = f"{sanitize_output_stem(source_a.stem)}-bilingual"
+    output_path = Path.cwd() / f"{output_stem}.epub"
+    config_path = Path.cwd() / f"{output_stem}.alignment.json"
+    work_dir = Path.cwd() / f"{output_stem}-work"
+
+    print()
+    print(f"Output file will be written to: {output_path}")
+    print(f"Alignment config will be stored in: {config_path}")
+    print(f"Working files will be stored in: {work_dir}")
+    print()
+
+    args = argparse.Namespace(
+        source_a=source_a,
+        source_b=source_b,
+        output=output_path,
+        config=config_path,
+        work_dir=work_dir,
+        label_a=label_a,
+        label_b=label_b,
+        title="",
+        max_auto_span=4,
+        non_interactive=False,
+        same_order=same_order,
+    )
+    return merge_epubs(args)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Combine two book files into a bilingual output."
+        description="Combine two book files into a bilingual output.",
+        epilog="Run without a subcommand to start interactive mode.",
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command", required=False)
 
     inspect_parser = subparsers.add_parser(
         "inspect",
@@ -2306,14 +2416,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to the config file to create.",
     )
     init_config_parser.add_argument(
+        "--language-a",
         "--label-a",
+        dest="label_a",
         default="Language A",
-        help="Default display label for source A.",
+        help="Display name for source A.",
     )
     init_config_parser.add_argument(
+        "--language-b",
         "--label-b",
+        dest="label_b",
         default="Language B",
-        help="Default display label for source B.",
+        help="Display name for source B.",
     )
     init_config_parser.add_argument(
         "--force",
@@ -2347,14 +2461,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory for generated review files.",
     )
     merge_parser.add_argument(
+        "--language-a",
         "--label-a",
+        dest="label_a",
         default="Language A",
-        help="Display label for source A in the merged output.",
+        help="Display name for source A in the merged output.",
     )
     merge_parser.add_argument(
+        "--language-b",
         "--label-b",
+        dest="label_b",
         default="Language B",
-        help="Display label for source B in the merged output.",
+        help="Display name for source B in the merged output.",
     )
     merge_parser.add_argument(
         "--title",
@@ -2371,6 +2489,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     merge_parser.add_argument(
+        "--same-order",
+        action="store_true",
+        help="Use chapter order as the default chapter pairing when both books have the same number of main chapters.",
+    )
+    merge_parser.add_argument(
         "--non-interactive",
         action="store_true",
         help="Do not prompt. Missing chapter pairs or alignments will raise an error.",
@@ -2383,6 +2506,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.command is None:
+            return interactive_wizard()
         return args.func(args)
     except AlignmentError as exc:
         print(f"Error: {exc}", file=sys.stderr)

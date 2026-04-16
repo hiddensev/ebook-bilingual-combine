@@ -43,16 +43,46 @@ ebook-bilingual-combine --help
 
 ## Quick Start
 
-1. Create a config file.
+The simplest usage is just:
 
 ```bash
-ebook-bilingual-combine init-config \
-  --config alignment-config.json \
-  --label-a English \
-  --label-b Chinese
+ebook-bilingual-combine
 ```
 
-2. Inspect the two sources after cleanup.
+This starts interactive mode. The tool will ask:
+
+1. what the first language is called
+2. what the second language is called
+3. where the first eBook file is
+4. where the second eBook file is
+
+Then it will:
+
+- create a per-run alignment config automatically
+- try to merge the two books
+- tell you where the output file was written
+- ask you for help only if chapter pairing or paragraph alignment still needs manual input
+
+By default, interactive mode writes its output, alignment config, and working
+directory into the current directory.
+
+You do not need to create a config file first for normal usage.
+
+## What The Commands Mean
+
+`ebook-bilingual-combine`
+
+- the recommended mode
+- enters the interactive question-and-answer flow
+- best for normal users
+
+`ebook-bilingual-combine inspect`
+
+- an advanced debugging command
+- shows the chapter list after cleanup and preprocessing
+- useful if you want to see which chapters were skipped, how many paragraphs were kept, and where mismatches might come from
+
+Example:
 
 ```bash
 ebook-bilingual-combine inspect \
@@ -61,7 +91,26 @@ ebook-bilingual-combine inspect \
   --config alignment-config.json
 ```
 
-3. Merge them.
+`ebook-bilingual-combine init-config`
+
+- an advanced setup command
+- writes a reusable config template if you want to customize cleanup keywords yourself
+
+Example:
+
+```bash
+ebook-bilingual-combine init-config \
+  --config alignment-config.json \
+  --language-a English \
+  --language-b Chinese
+```
+
+`ebook-bilingual-combine merge`
+
+- the advanced non-wizard command
+- useful if you want full control over output path, config path, or work directory
+
+Example:
 
 ```bash
 ebook-bilingual-combine merge \
@@ -69,10 +118,10 @@ ebook-bilingual-combine merge \
   "/path/to/book-b.epub" \
   --config alignment-config.json \
   --output merged-bilingual.epub \
-  --work-dir merge-work
+  --work-dir merge-work \
+  --language-a English \
+  --language-b Chinese
 ```
-
-If you omit one or both source paths, the tool prompts for them.
 
 ## How It Works
 
