@@ -127,7 +127,7 @@ Then it will:
 - create a per-run alignment config automatically
 - try to merge the two books
 - tell you where the output file was written
-- ask you for help only if chapter pairing or paragraph alignment still needs manual input
+- ask you for help only if chapter pairing still needs manual input
 
 By default, interactive mode writes its output, alignment config, and working
 directory into the current directory.
@@ -200,8 +200,8 @@ ebook-bilingual-combine merge \
 - separates obvious trailing note blocks at chapter ends, such as a final `注释` heading followed by bracketed note paragraphs
 - keeps those trailing notes in the final output, but excludes them from paragraph matching
 - aligns chapters by paragraph count when possible
-- if counts still differ, tries local paragraph-block alignment by length signals before asking for manual help
-- stores chapter pairings and manual alignments in a JSON config file
+- if counts still differ, tries local paragraph-block alignment by length signals and automatically adopts the suggested paragraph ranges
+- stores chapter pairings and paragraph alignments in a JSON config file
 
 If both sides end up with the same number of chapters after obvious cleanup, the
 tool pairs chapters by order.
@@ -285,7 +285,7 @@ This is meant to catch common editorial differences such as one long paragraph o
 
 ## Manual Alignment
 
-If automatic alignment is still not confident enough, the tool writes a review file under `merge-work/review/` and prompts for manual ranges.
+If the tool cannot produce any paragraph-range suggestion at all, it writes a review file under `merge-work/review/` so you can inspect the mismatch.
 
 Example input:
 

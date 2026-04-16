@@ -1968,7 +1968,7 @@ def resolve_alignments(
             suggestion is None or fallback.average_cost < suggestion.average_cost
         ):
             suggestion = fallback
-    if suggestion is not None and auto_alignment_is_confident(suggestion):
+    if suggestion is not None:
         pair["alignments"] = suggestion.alignments
         save_config(config_path, config)
         summary = summarize_nontrivial_alignments(suggestion.alignments)
@@ -2012,40 +2012,11 @@ def resolve_alignments(
         return None
 
     print()
-    print(f"Paragraph counts still differ for {pair['title']}.")
+    print(f"Missing paragraph alignment for {pair['title']}.")
     print(f"  {label_a}: {chapter_a.paragraph_count}")
     print(f"  {label_b}: {chapter_b.paragraph_count}")
     print(f"  Review file: {review_path}")
-    if suggestion is not None:
-        summary = summarize_nontrivial_alignments(suggestion.alignments)
-        if summary:
-            print("  Suggested non-1:1 ranges: " + ", ".join(summary))
-        print(
-            "Press Enter to accept the suggested ranges, "
-            "or enter your own comma-separated A=B items."
-        )
-    print(
-        "Enter paragraph ranges as comma-separated A=B items. "
-        "Example: 1=1,2-3=2,4=3-4"
-    )
-
-    while True:
-        raw = input("Alignment ranges: ").strip()
-        if not raw and suggestion is not None:
-            pair["alignments"] = suggestion.alignments
-            save_config(config_path, config)
-            return suggestion.alignments
-        try:
-            alignments = parse_alignment_ranges(
-                raw,
-                chapter_a.paragraph_count,
-                chapter_b.paragraph_count,
-            )
-            pair["alignments"] = alignments
-            save_config(config_path, config)
-            return alignments
-        except AlignmentError as exc:
-            print(f"  {exc}")
+    return None
 
 
 def build_merged_chapter(
