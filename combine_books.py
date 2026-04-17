@@ -2114,6 +2114,9 @@ def build_merged_chapter_xhtml(
     chapter: MergedChapter,
     label_a: str,
     label_b: str,
+    language_a: str,
+    language_b: str,
+    primary_language: str,
 ) -> str:
     blocks: list[str] = []
     for segment in chapter.segments:
@@ -2121,10 +2124,10 @@ def build_merged_chapter_xhtml(
             textwrap.dedent(
                 f"""\
                 <section class="pair" id="chapter-{chapter.index:02d}-segment-{segment.index:04d}">
-                  <div class="lang-block lang-a">
+                  <div class="lang-block lang-a" lang="{xml_escape(language_a)}" xml:lang="{xml_escape(language_a)}">
                     {''.join(paragraph.html for paragraph in segment.paragraphs_a)}
                   </div>
-                  <div class="lang-block lang-b">
+                  <div class="lang-block lang-b" lang="{xml_escape(language_b)}" xml:lang="{xml_escape(language_b)}">
                     {''.join(paragraph.html for paragraph in segment.paragraphs_b)}
                   </div>
                 </section>
@@ -2137,10 +2140,10 @@ def build_merged_chapter_xhtml(
             textwrap.dedent(
                 f"""\
                 <section class="pair pair-notes" id="chapter-{chapter.index:02d}-notes">
-                  <div class="lang-block lang-a">
+                  <div class="lang-block lang-a" lang="{xml_escape(language_a)}" xml:lang="{xml_escape(language_a)}">
                     {''.join(paragraph.html for paragraph in chapter.trailing_note_paragraphs_a)}
                   </div>
-                  <div class="lang-block lang-b">
+                  <div class="lang-block lang-b" lang="{xml_escape(language_b)}" xml:lang="{xml_escape(language_b)}">
                     {''.join(paragraph.html for paragraph in chapter.trailing_note_paragraphs_b)}
                   </div>
                 </section>
@@ -2151,7 +2154,7 @@ def build_merged_chapter_xhtml(
     return textwrap.dedent(
         f"""\
         <?xml version="1.0" encoding="utf-8"?>
-        <html xmlns="{XHTML_NS}" xmlns:epub="{EPUB_NS}" xml:lang="mul">
+        <html xmlns="{XHTML_NS}" xmlns:epub="{EPUB_NS}" lang="{xml_escape(primary_language)}" xml:lang="{xml_escape(primary_language)}">
           <head>
             <title>{xml_escape(chapter.title)}</title>
             <link rel="stylesheet" type="text/css" href="styles/main.css" />
@@ -2229,7 +2232,23 @@ def build_ncx(identifier: str, title: str, chapters: list[dict]) -> str:
     ).lstrip()
 
 
-def build_opf(identifier: str, title: str, creator: str, chapters: list[dict]) -> str:
+def normalize_language_code(language: str | None, fallback: str) -> str:
+    value = (language or "").strip().replace("_", "-")
+    if not value:
+        return fallback
+    folded = value.casefold()
+    if folded in {"und", "mul", "zxx"}:
+        return fallback
+    return value
+
+
+def build_opf(
+    identifier: str,
+    title: str,
+    creator: str,
+    chapters: list[dict],
+    primary_language: str,
+) -> str:
     manifest_items = [
         '<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>',
         '<item id="css" href="styles/main.css" media-type="text/css"/>',
@@ -2259,7 +2278,7 @@ def build_opf(identifier: str, title: str, creator: str, chapters: list[dict]) -
             <dc:identifier id="bookid">{identifier}</dc:identifier>
             <dc:title>{xml_escape(title)}</dc:title>
             <dc:creator>{xml_escape(creator)}</dc:creator>
-            <dc:language>mul</dc:language>
+            <dc:language>{xml_escape(primary_language)}</dc:language>
             <meta property="dcterms:modified">{modified}</meta>
           </metadata>
           <manifest>
@@ -2319,8 +2338,13 @@ def write_epub_output(
     merged_chapters: list[MergedChapter],
     label_a: str,
     label_b: str,
+    language_a: str,
+    language_b: str,
 ) -> None:
     identifier = f"urn:uuid:{uuid.uuid4()}"
+    normalized_language_a = normalize_language_code(language_a, "en")
+    normalized_language_b = normalize_language_code(language_b, normalized_language_a)
+    primary_language = normalized_language_a
     container_xml = textwrap.dedent(
         f"""\
         <?xml version="1.0" encoding="utf-8"?>
@@ -2335,13 +2359,20 @@ def write_epub_output(
         {
             "title": chapter.title,
             "file_name": f"chapter-{chapter.index:02d}.xhtml",
-            "content": build_merged_chapter_xhtml(chapter, label_a, label_b),
+            "content": build_merged_chapter_xhtml(
+                chapter,
+                label_a,
+                label_b,
+                normalized_language_a,
+                normalized_language_b,
+                primary_language,
+            ),
         }
         for chapter in merged_chapters
     ]
     nav_xhtml = build_nav_xhtml(chapter_documents)
     ncx = build_ncx(identifier, title, chapter_documents)
-    opf = build_opf(identifier, title, creator, chapter_documents)
+    opf = build_opf(identifier, title, creator, chapter_documents, primary_language)
     stylesheet = epub_stylesheet()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2420,10 +2451,21 @@ def write_output(
     merged_chapters: list[MergedChapter],
     label_a: str,
     label_b: str,
+    language_a: str,
+    language_b: str,
 ) -> None:
     suffix = output_path.suffix.lower()
     if suffix in EPUB_OUTPUT_SUFFIXES:
-        write_epub_output(output_path, title, creator, merged_chapters, label_a, label_b)
+        write_epub_output(
+            output_path,
+            title,
+            creator,
+            merged_chapters,
+            label_a,
+            label_b,
+            language_a,
+            language_b,
+        )
         return
     if suffix in MARKDOWN_OUTPUT_SUFFIXES:
         write_markdown_output(output_path, title, merged_chapters, label_a, label_b)
@@ -2499,6 +2541,8 @@ def merge_epubs(args: argparse.Namespace) -> int:
         merged_chapters,
         label_a,
         label_b,
+        book_a.language,
+        book_b.language,
     )
     save_config(args.config, config)
     print(f"Merged output written to {args.output}")
