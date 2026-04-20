@@ -55,10 +55,12 @@ CHAPTER_RESOLVER_SYSTEM_PROMPT = textwrap.dedent(
     - Do not invent chapters, hrefs, indices, or mappings not supported by the input.
     - Always identify chapters by the exact href strings provided in the input.
     - Never renumber chapters or invent new hrefs.
-    - `fixed_label` is immutable. Chapters with a non-null `fixed_label` are structural
-      chapters and must never appear in `mapping_units` or `info_request`.
-    - `alignable_candidate_hrefs` is the only set of chapters you may use for
-      `main_text_range` boundaries, `mapping_units`, and `info_request`.
+    - Use the raw chapter list exactly as provided. Do not assume any local heuristic
+      has already filtered frontmatter, contents, divider pages, or backmatter.
+    - Choose `main_text_range` yourself from the chapter hrefs in the input.
+    - Treat `main_text_range` as the first and last aligned narrative chapters.
+    - Use `excluded_hrefs` for any chapters that are clearly not part of the aligned
+      narrative flow, whether they appear before, within, or after that range.
     - Judge chapter-directory semantics from the raw `title` strings and local order
       progression. Decide semantically whether a title looks like a chapter, a part
       marker, or something else.
@@ -130,6 +132,12 @@ TRAILING_NOTE_PARAGRAPH_RE = re.compile(
     r"[\[【〔(（]\s*\d+\s*[\]】〕)）][\s.:：、]*"
     r"|"
     r"\d+\s*[\].．)、:：][\s]*"
+    r"|"
+    r"[\[【〔(（]\s*(?:[A-Za-z]|[ivxlcdmIVXLCDM]+|[一二三四五六七八九十百千零〇两]+)\s*[\]】〕)）][\s.:：、]*"
+    r"|"
+    r"(?:\*|†|‡|§|¶|#)+[\s.:：、-]*"
+    r"|"
+    r"(?:[A-Za-z]|[ivxlcdmIVXLCDM]+)\s*[\].．)、:：][\s]*"
     r"|"
     r"(?:注|注释)\s*[:：]"
     r")",
@@ -1014,7 +1022,7 @@ def is_note_content_paragraph(text: str) -> bool:
 
 
 def find_trailing_note_cutoff(paragraphs: list[Paragraph]) -> int | None:
-    if len(paragraphs) < 2:
+    if not paragraphs:
         return None
 
     # Case 1: an explicit note heading like "注释" or "【注释】" appears near the end.
@@ -1037,10 +1045,7 @@ def find_trailing_note_cutoff(paragraphs: list[Paragraph]) -> int | None:
     if tail_start is None:
         return None
 
-    tail_length = len(paragraphs) - tail_start
-    if tail_length >= 2:
-        return tail_start
-    return None
+    return tail_start
 
 
 def find_trailing_backmatter_cutoff(
@@ -1674,19 +1679,7 @@ def chapter_directory_payload(
     cleanup_rules: CleanupRules,
 ) -> dict:
     chapters: list[dict] = []
-    alignable_candidate_hrefs: list[str] = []
-    fixed_structural_hrefs = {
-        "frontmatter_skip": [],
-        "backmatter_skip": [],
-        "preview_skip": [],
-        "section_divider": [],
-    }
     for chapter in book.chapters:
-        fixed_label = fixed_structural_label(book, chapter, cleanup_rules)
-        if fixed_label is None:
-            alignable_candidate_hrefs.append(chapter.href)
-        else:
-            fixed_structural_hrefs[fixed_label].append(chapter.href)
         chapters.append(
             {
                 "index": chapter.order,
@@ -1694,18 +1687,12 @@ def chapter_directory_payload(
                 "title": chapter.title,
                 "toc_title": chapter.title,
                 "paragraph_count": chapter.paragraph_count,
-                "fixed_label": fixed_label,
             }
         )
     return {
         "title": book.title,
         "language": book.language,
-        "alignable_candidate_hrefs": alignable_candidate_hrefs,
-        "full_span_hint": [
-            alignable_candidate_hrefs[0],
-            alignable_candidate_hrefs[-1],
-        ] if alignable_candidate_hrefs else [],
-        "fixed_structural_hrefs": fixed_structural_hrefs,
+        "all_chapter_hrefs": [chapter.href for chapter in book.chapters],
         "chapters": chapters,
     }
 
@@ -1787,6 +1774,7 @@ def chapter_mapping_iteration_response_schema() -> dict:
             "status",
             "continuous_main_text",
             "main_text_range",
+            "excluded_hrefs",
             "mapping_units",
             "info_request",
         ],
@@ -1815,6 +1803,21 @@ def chapter_mapping_iteration_response_schema() -> dict:
                     },
                 },
             },
+            "excluded_hrefs": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["a", "b"],
+                "properties": {
+                    "a": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                    },
+                    "b": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                    },
+                },
+            },
             "mapping_units": {"type": "array", "items": mapping_unit_schema},
             "info_request": {
                 "anyOf": [
@@ -1838,17 +1841,18 @@ def build_chapter_mapping_prompt(
         "1. Use chapter-directory semantics first: raw titles and local order progression.",
         "2. Assume mismatches are usually local adjacent split/merge cases, not global reshuffles.",
         "3. Find whether there is one continuous main-text span in both books.",
-        "4. Work strictly from left to right. Lock in the earliest confirmed prefix first.",
-        "5. If the directory alone supports a clear 1:1 continuation, extend the confirmed prefix immediately.",
-        "6. Do not leave the confirmed prefix empty if the left edge is already clear from the directory.",
-        "7. If the next local region is ambiguous, return status=request_more_info and request exactly one smallest local window for that earliest ambiguity.",
-        "8. After supplemental openings are provided, settle that local ambiguity, extend the confirmed prefix, and only then continue.",
+        "4. Use excluded_hrefs for any clearly non-narrative items, such as contents pages, copyright pages, standalone divider pages, acknowledgements, or previews.",
+        "5. Work strictly from left to right. Lock in the earliest confirmed prefix first.",
+        "6. If the directory alone supports a clear 1:1 continuation, extend the confirmed prefix immediately.",
+        "7. Do not leave the confirmed prefix empty if the left edge is already clear from the directory.",
+        "8. If the next local region is ambiguous, return status=request_more_info and request exactly one smallest local window for that earliest ambiguity.",
+        "9. After supplemental openings are provided, settle that local ambiguity, extend the confirmed prefix, and only then continue.",
         "",
         "Hard rules:",
-        "- If fixed_label is not null, that chapter is structural and must not appear in mapping_units or info_request.",
-        "- main_text_range boundaries must come from alignable_candidate_hrefs.",
-        "- main_text_range must cover the full continuous alignable narrative span, which is usually the provided full_span_hint.",
-        "- Every href in mapping_units and info_request must come from alignable_candidate_hrefs.",
+        "- main_text_range boundaries must be hrefs that exist in the input chapters.",
+        "- Every href in excluded_hrefs, mapping_units, and info_request must exist in the input chapters.",
+        "- excluded_hrefs may contain any chapter href in either book if it is clearly outside the aligned narrative flow.",
+        "- Chapters listed in excluded_hrefs must never appear in mapping_units or info_request.",
         "- Within each mapping unit, keep chapter hrefs contiguous on each side.",
         "- locked_mapping_units are immutable and must appear as the exact prefix of mapping_units.",
         "- When the left edge is clear, mapping_units must include that clear confirmed prefix before requesting more info.",
@@ -1858,7 +1862,7 @@ def build_chapter_mapping_prompt(
         "- In status=request_more_info, mapping_units must contain only the confirmed prefix and info_request must be a single earliest ambiguous local window.",
         "- In status=resolved, info_request must be null and mapping_units must contain the full final mapping.",
         "- Do not request a href if supplemental openings for that href are already present in the input.",
-        "- In the final resolved mapping, cover every alignable chapter inside the chosen main_text_range exactly once.",
+        "- In the final resolved mapping, cover every non-excluded chapter inside the chosen main_text_range exactly once.",
         "",
         "Input JSON:",
         json.dumps(payload, ensure_ascii=False),
@@ -1933,21 +1937,10 @@ def log_chapter_resolver_debug(message: str) -> None:
         print(f"[chapter-resolver] {message}")
 
 
-def semantic_labels_for_book(
-    book: Book,
-    cleanup_rules: CleanupRules,
-) -> dict[str, str]:
-    labels: dict[str, str] = {}
-    for chapter in book.chapters:
-        labels[chapter.href] = fixed_structural_label(book, chapter, cleanup_rules) or "main"
-    return labels
-
-
 def validate_semantic_main_text_range(
     result: dict,
     books: dict[str, Book],
     href_to_order: dict[str, dict[str, int]],
-    labels_by_side: dict[str, dict[str, str]],
 ) -> None:
     for side in ("a", "b"):
         start_href, end_href = result["main_text_range"][side]
@@ -1955,23 +1948,25 @@ def validate_semantic_main_text_range(
         end_order = href_to_order[side].get(end_href)
         if start_order is None or end_order is None or end_order < start_order:
             raise AlignmentError(f"Invalid main_text_range for source {side.upper()}.")
-        if labels_by_side[side][start_href] != "main" or labels_by_side[side][end_href] != "main":
-            raise AlignmentError(
-                f"Semantic resolver chose a structural chapter as a main-text boundary for source {side.upper()}."
-            )
-        main_hrefs = [
-            chapter.href
-            for chapter in books[side].chapters
-            if labels_by_side[side][chapter.href] == "main"
-        ]
-        if not main_hrefs:
-            raise AlignmentError(f"Source {side.upper()} has no alignable main chapters.")
-        expected_range = [main_hrefs[0], main_hrefs[-1]]
-        if [start_href, end_href] != expected_range:
-            raise AlignmentError(
-                f"Semantic resolver returned an incomplete main_text_range for source {side.upper()}. "
-                f"Expected {expected_range}, got {[start_href, end_href]}."
-            )
+
+
+def validate_semantic_excluded_hrefs(
+    result: dict,
+    books: dict[str, Book],
+    href_to_order: dict[str, dict[str, int]],
+) -> dict[str, set[str]]:
+    excluded_sets: dict[str, set[str]] = {"a": set(), "b": set()}
+    for side in ("a", "b"):
+        chapter_hrefs = {chapter.href for chapter in books[side].chapters}
+        excluded: set[str] = set()
+        for href in result["excluded_hrefs"][side]:
+            if href not in chapter_hrefs:
+                raise AlignmentError(
+                    f"Semantic resolver excluded an unknown chapter href: {href}"
+                )
+            excluded.add(href)
+        excluded_sets[side] = excluded
+    return excluded_sets
 
 
 def collect_requested_opening_context(
@@ -1998,11 +1993,11 @@ def semantic_required_main_href_sequence(result: dict, book: Book, side: str) ->
     href_to_order = {chapter.href: chapter.order for chapter in book.chapters}
     start_order = href_to_order[start_href]
     end_order = href_to_order[end_href]
-    labels = result.get("labels_by_side", {}).get(side, {})
+    excluded = set(result.get("excluded_hrefs", {}).get(side, []))
     return [
         chapter.href
         for chapter in book.chapters[start_order - 1 : end_order]
-        if labels.get(chapter.href, "main") == "main"
+        if chapter.href not in excluded
     ]
 
 
@@ -2020,11 +2015,8 @@ def validate_semantic_mapping_units(
         side: {chapter.href: chapter.order for chapter in book.chapters}
         for side, book in books.items()
     }
-    labels_by_side = {
-        "a": semantic_labels_for_book(book_a, cleanup_rules),
-        "b": semantic_labels_for_book(book_b, cleanup_rules),
-    }
-    validate_semantic_main_text_range(result, books, href_to_order, labels_by_side)
+    validate_semantic_main_text_range(result, books, href_to_order)
+    excluded_by_side = validate_semantic_excluded_hrefs(result, books, href_to_order)
 
     locked_mapping_units = locked_mapping_units or []
     if len(result["mapping_units"]) < len(locked_mapping_units):
@@ -2062,11 +2054,11 @@ def validate_semantic_mapping_units(
             raise AlignmentError("Semantic resolver returned overlapping mapping hrefs.")
         if a_orders[0] <= previous_a or b_orders[0] <= previous_b:
             raise AlignmentError("Semantic resolver returned out-of-order mapping units.")
-        if any(labels_by_side["a"][href] != "main" for href in a_hrefs) or any(
-            labels_by_side["b"][href] != "main" for href in b_hrefs
+        if any(href in excluded_by_side["a"] for href in a_hrefs) or any(
+            href in excluded_by_side["b"] for href in b_hrefs
         ):
             raise AlignmentError(
-                "Semantic resolver referenced a structural chapter inside mapping_units."
+                "Semantic resolver referenced an excluded chapter inside mapping_units."
             )
 
         range_a = result["main_text_range"]["a"]
@@ -2129,7 +2121,7 @@ def validate_semantic_mapping_units(
                     "Semantic resolver emitted a grouped mapping that is not directly supported by any supplied opening window."
                 )
 
-    result["labels_by_side"] = labels_by_side
+    result["excluded_by_side"] = excluded_by_side
     result["normalized_pairs"] = normalized_pairs
     result["href_to_order"] = href_to_order
     return result
@@ -2198,7 +2190,7 @@ def validate_semantic_info_request(
         )
 
     href_to_order = result["href_to_order"]
-    labels_by_side = result["labels_by_side"]
+    excluded_by_side = result["excluded_by_side"]
     for side, hrefs in (("a", request["a_hrefs"]), ("b", request["b_hrefs"])):
         try:
             orders = [href_to_order[side][href] for href in hrefs]
@@ -2206,9 +2198,9 @@ def validate_semantic_info_request(
             raise AlignmentError(
                 f"Semantic resolver requested an unknown chapter href: {exc.args[0]}"
             ) from exc
-        if any(labels_by_side[side][href] != "main" for href in hrefs):
+        if any(href in excluded_by_side[side] for href in hrefs):
             raise AlignmentError(
-                "Semantic resolver requested structural chapters for supplemental openings."
+                "Semantic resolver requested excluded chapters for supplemental openings."
             )
         if orders != sorted(orders) or orders != list(range(orders[0], orders[-1] + 1)):
             raise AlignmentError("Semantic resolver requested a non-contiguous chapter window.")
@@ -2326,6 +2318,27 @@ def summarize_semantic_pairs(pairs: list[dict], book_a: Book, book_b: Book) -> l
     return lines
 
 
+def semantic_result_for_config(result: dict) -> dict:
+    return {
+        "status": result["status"],
+        "continuous_main_text": result["continuous_main_text"],
+        "main_text_range": copy.deepcopy(result["main_text_range"]),
+        "excluded_hrefs": copy.deepcopy(result["excluded_hrefs"]),
+        "mapping_units": [
+            {
+                "id": unit["id"],
+                "a_hrefs": list(unit["a_hrefs"]),
+                "b_hrefs": list(unit["b_hrefs"]),
+                "relation": unit["relation"],
+                "confidence": unit["confidence"],
+                "evidence": list(unit["evidence"]),
+            }
+            for unit in result["mapping_units"]
+        ],
+        "info_request": copy.deepcopy(result["info_request"]),
+    }
+
+
 def resolve_chapter_pairs_with_llm(
     book_a: Book,
     book_b: Book,
@@ -2420,7 +2433,7 @@ def resolve_chapter_pairs_with_llm(
         if result is None:
             continue
         if result["status"] == "resolved":
-            config["semantic_chapter_mapping"] = result
+            config["semantic_chapter_mapping"] = semantic_result_for_config(result)
             config["chapter_pairs"] = result["normalized_pairs"]
             return result
 
@@ -2916,25 +2929,7 @@ def anomaly_guided_auto_align_chapter(
         remaining_a = count_a - index_a
         remaining_b = count_b - index_b
         if remaining_a == remaining_b:
-            for offset in range(remaining_a):
-                alignments.append(
-                    {
-                        "a": [index_a + offset + 1, index_a + offset + 1],
-                        "b": [index_b + offset + 1, index_b + offset + 1],
-                    }
-                )
-                costs.append(
-                    block_alignment_cost(
-                        prefixes_a,
-                        prefixes_b,
-                        index_a + offset,
-                        index_a + offset + 1,
-                        index_b + offset,
-                        index_b + offset + 1,
-                        expected_char_ratio,
-                    )
-                )
-            return build_auto_alignment_result(alignments, costs)
+            return None
 
         pair_scores = [
             block_alignment_cost(
@@ -3218,8 +3213,6 @@ def resolve_alignments(
     label_b: str,
     max_auto_span: int,
 ) -> list[dict] | None:
-    if chapter_a.paragraph_count == chapter_b.paragraph_count and not pair.get("alignments"):
-        return one_to_one_alignment(chapter_a.paragraph_count)
     if pair.get("alignments"):
         return validate_alignment_ranges(
             pair["alignments"],

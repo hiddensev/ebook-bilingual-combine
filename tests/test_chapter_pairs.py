@@ -119,6 +119,7 @@ class ChapterPairTests(unittest.TestCase):
                     "a": ["a-1.xhtml", "a-2.xhtml"],
                     "b": ["b-1.xhtml", "b-2.xhtml"],
                 },
+                "excluded_hrefs": {"a": [], "b": []},
                 "mapping_units": [
                     {
                         "id": "m1",
@@ -145,7 +146,7 @@ class ChapterPairTests(unittest.TestCase):
         )
 
         self.assertEqual(result["normalized_pairs"][0]["a_hrefs"], ["a-1.xhtml"])
-        self.assertEqual(result["labels_by_side"]["a"]["a-1.xhtml"], "main")
+        self.assertEqual(result["excluded_by_side"]["a"], set())
 
     def test_validate_semantic_info_request_accepts_local_window(self) -> None:
         book_a = make_book(
@@ -172,6 +173,7 @@ class ChapterPairTests(unittest.TestCase):
                     "a": ["a-1.xhtml", "a-2.xhtml"],
                     "b": ["b-1.xhtml", "b-3.xhtml"],
                 },
+                "excluded_hrefs": {"a": [], "b": []},
                 "mapping_units": [],
                 "info_request": {
                     "request_id": "req-1",
@@ -184,6 +186,132 @@ class ChapterPairTests(unittest.TestCase):
             book_b,
             cleanup_rules,
             {"a": set(), "b": set()},
+        )
+
+    def test_validate_semantic_resolution_allows_exclusions_outside_main_text_range(self) -> None:
+        book_a = make_book(
+            "Book A",
+            "a-",
+            [["front"], ["body-a1"], ["body-a2"], ["preview"]],
+        )
+        book_b = make_book(
+            "Book B",
+            "b-",
+            [["toc"], ["body-b1"], ["body-b2"], ["afterword"]],
+        )
+        cleanup_rules = combine_books.build_cleanup_rules({})
+
+        result = combine_books.validate_semantic_resolution(
+            {
+                "status": "resolved",
+                "continuous_main_text": True,
+                "main_text_range": {
+                    "a": ["a-2.xhtml", "a-3.xhtml"],
+                    "b": ["b-2.xhtml", "b-3.xhtml"],
+                },
+                "excluded_hrefs": {
+                    "a": ["a-1.xhtml", "a-4.xhtml"],
+                    "b": ["b-1.xhtml", "b-4.xhtml"],
+                },
+                "mapping_units": [
+                    {
+                        "id": "m1",
+                        "a_hrefs": ["a-2.xhtml"],
+                        "b_hrefs": ["b-2.xhtml"],
+                        "relation": "1:1",
+                        "confidence": 0.9,
+                        "evidence": ["match"],
+                    },
+                    {
+                        "id": "m2",
+                        "a_hrefs": ["a-3.xhtml"],
+                        "b_hrefs": ["b-3.xhtml"],
+                        "relation": "1:1",
+                        "confidence": 0.9,
+                        "evidence": ["match"],
+                    },
+                ],
+                "info_request": None,
+            },
+            book_a,
+            book_b,
+            cleanup_rules,
+        )
+
+        self.assertEqual(result["excluded_by_side"]["a"], {"a-1.xhtml", "a-4.xhtml"})
+        self.assertEqual(result["excluded_by_side"]["b"], {"b-1.xhtml", "b-4.xhtml"})
+
+    def test_normalize_paragraphs_moves_single_trailing_note(self) -> None:
+        cleanup_rules = combine_books.build_cleanup_rules({})
+        raw = [
+            make_paragraph(1, "正文第一段。"),
+            make_paragraph(2, "(1) 这是尾注内容。"),
+        ]
+
+        kept, trailing_notes, removed = combine_books.normalize_paragraphs(
+            "正文标题",
+            raw,
+            cleanup_rules,
+        )
+
+        self.assertEqual([paragraph.text for paragraph in kept], ["正文第一段。"])
+        self.assertEqual(
+            [paragraph.text for paragraph in trailing_notes],
+            ["(1) 这是尾注内容。"],
+        )
+        self.assertEqual(removed, [])
+
+    def test_trailing_note_cleanup_breaks_false_equal_count_alignment(self) -> None:
+        cleanup_rules = combine_books.build_cleanup_rules({})
+        chapter_a = combine_books.build_chapter(
+            1,
+            1,
+            "a-1.xhtml",
+            "A 1",
+            [
+                make_paragraph(1, "(FEBRUARY 2015)"),
+                make_paragraph(2, "正文第一段。"),
+                make_paragraph(3, "正文第二段。"),
+            ],
+            cleanup_rules,
+        )
+        chapter_b = combine_books.build_chapter(
+            1,
+            1,
+            "b-1.xhtml",
+            "B 1",
+            [
+                make_paragraph(1, "正文第一段。"),
+                make_paragraph(2, "正文第二段。"),
+                make_paragraph(3, "(1) 注释。"),
+            ],
+            cleanup_rules,
+        )
+
+        self.assertIsNotNone(chapter_a)
+        self.assertIsNotNone(chapter_b)
+        assert chapter_a is not None
+        assert chapter_b is not None
+        self.assertEqual(chapter_a.paragraph_count, 3)
+        self.assertEqual(chapter_b.paragraph_count, 2)
+        self.assertEqual(
+            [paragraph.text for paragraph in chapter_b.trailing_note_paragraphs],
+            ["(1) 注释。"],
+        )
+
+        result = combine_books.anomaly_guided_auto_align_chapter(
+            chapter_a,
+            chapter_b,
+            max_span=2,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertTrue(
+            any(
+                segment["a"][0] != segment["a"][1]
+                or segment["b"][0] != segment["b"][1]
+                for segment in result.alignments
+            )
         )
 
 
