@@ -6,6 +6,7 @@ import copy
 import json
 import math
 import os
+import posixpath
 import re
 import sys
 import textwrap
@@ -15,7 +16,8 @@ import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html import escape as html_escape
-from pathlib import Path
+from html.parser import HTMLParser
+from pathlib import Path, PurePosixPath
 
 XHTML_NS = "http://www.w3.org/1999/xhtml"
 OPF_NS = "http://www.idpf.org/2007/opf"
@@ -24,6 +26,82 @@ CONTAINER_NS = "urn:oasis:names:tc:opendocument:xmlns:container"
 EPUB_NS = "http://www.idpf.org/2007/ops"
 NCX_NS = "http://www.daisy.org/z3986/2005/ncx/"
 XML_NS = "http://www.w3.org/XML/1998/namespace"
+ENV_FILE_NAME = ".env"
+DEFAULT_CHAPTER_RESOLVER_MODEL = "gpt-5.4-mini"
+DEFAULT_CHAPTER_RESOLVER_TIMEOUT_SECONDS = 120.0
+DEFAULT_CHAPTER_RESOLVER_MAX_ATTEMPTS = 3
+DEFAULT_CHAPTER_RESOLVER_MAX_INFO_REQUEST_ROUNDS = 8
+DEFAULT_CHAPTER_EXCERPT_COUNT = 3
+DEFAULT_CHAPTER_EXCERPT_CHAR_LIMIT = 500
+CHAPTER_RESOLVER_SYSTEM_PROMPT = textwrap.dedent(
+    """\
+    You are a bilingual chapter-mapping resolver.
+
+    Workflow:
+    - Round 1 receives chapter directory metadata only.
+    - Later rounds may include supplemental opening paragraphs for one specifically
+      requested local chapter window.
+    - Each round also includes locked_mapping_units, which are already confirmed and
+      must not be changed.
+
+    Objective:
+    - Identify the continuous main narrative span in each book.
+    - Align narrative chapters between those spans from left to right.
+    - Assume most mismatches are local adjacent split/merge cases, not global reshuffles.
+
+    Rules:
+    - Return valid JSON only.
+    - Do not summarize the books.
+    - Do not invent chapters, hrefs, indices, or mappings not supported by the input.
+    - Always identify chapters by the exact href strings provided in the input.
+    - Never renumber chapters or invent new hrefs.
+    - `fixed_label` is immutable. Chapters with a non-null `fixed_label` are structural
+      chapters and must never appear in `mapping_units` or `info_request`.
+    - `alignable_candidate_hrefs` is the only set of chapters you may use for
+      `main_text_range` boundaries, `mapping_units`, and `info_request`.
+    - Judge chapter-directory semantics from the raw `title` strings and local order
+      progression. Decide semantically whether a title looks like a chapter, a part
+      marker, or something else.
+    - If directory metadata is insufficient, return `status = "request_more_info"` and
+      ask for the single smallest local window needed, typically 1 chapter on one side
+      versus 1-3 adjacent chapters on the other.
+    - Only request opening paragraphs. Do not ask for full chapters or entire books.
+    - Do not request the same hrefs again if supplemental openings for them are already
+      present in the input.
+    - In `status = "request_more_info"`, `mapping_units` must contain only the confirmed
+      prefix from the start of the chosen main_text_range up to just before the earliest
+      unresolved local ambiguity.
+    - In `status = "resolved"`, `mapping_units` must contain the full final chapter
+      mapping.
+    - Final `mapping_units` must be monotonic, contiguous, non-overlapping, and cover
+      every chapter inside the chosen main_text_range exactly once.
+    - The goal is mergeable structure, not literary analysis.
+    """
+)
+SECTION_DIVIDER_TITLE_RE = re.compile(
+    r"^(?:part|book)\b|^第[\d一二三四五六七八九十百千零〇两]+部\b",
+    re.IGNORECASE,
+)
+PREVIEW_TITLE_RE = re.compile(
+    r"(?:continue reading|preview|next book|sample chapter)",
+    re.IGNORECASE,
+)
+HTML_VOID_TAGS = {
+    "area",
+    "base",
+    "br",
+    "col",
+    "embed",
+    "hr",
+    "img",
+    "input",
+    "link",
+    "meta",
+    "param",
+    "source",
+    "track",
+    "wbr",
+}
 
 SOURCE_SUFFIXES = {
     ".epub",
@@ -173,6 +251,7 @@ NON_MAIN_TITLE_EXACT = [
     "译序",
     "译者前言",
     "前言",
+    "文前",
     "导言",
     "序言",
     "序",
@@ -186,8 +265,11 @@ NON_MAIN_TITLE_EXACT = [
     "凡例",
     "扉页",
     "书名页",
+    "主要人物表",
+    "人物表",
     "献词",
     "献辞",
+    "致词",
 ]
 NON_MAIN_TITLE_PREFIXES = [
     "praise for ",
@@ -321,6 +403,20 @@ class Chapter:
 
 
 @dataclass
+class ChapterGroup:
+    title: str
+    hrefs: list[str]
+    paragraphs: list[Paragraph]
+    trailing_note_paragraphs: list[Paragraph]
+    removed_paragraphs: list[RemovedParagraph]
+    source_chapters: list[Chapter]
+
+    @property
+    def paragraph_count(self) -> int:
+        return len(self.paragraphs)
+
+
+@dataclass
 class SkippedChapter:
     href: str
     title: str
@@ -393,12 +489,135 @@ class AlignmentError(Exception):
     pass
 
 
+def default_chapter_resolver_model() -> str:
+    return (
+        os.getenv("OPENAI_CHAPTER_MAPPING_MODEL", "").strip()
+        or DEFAULT_CHAPTER_RESOLVER_MODEL
+    )
+
+
 def html_qname(tag: str) -> str:
     return f"{{{XHTML_NS}}}{tag}"
 
 
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
+
+
+def local_html_tag(tag: str) -> str:
+    return tag.split("}", 1)[-1] if "}" in tag else tag
+
+
+def is_html_element(element: ET.Element, tag: str) -> bool:
+    return local_html_tag(element.tag) == tag
+
+
+def find_first_html_element(root: ET.Element, tag: str) -> ET.Element | None:
+    for element in root.iter():
+        if is_html_element(element, tag):
+            return element
+    return None
+
+
+def find_all_html_elements(root: ET.Element, tag: str) -> list[ET.Element]:
+    return [element for element in root.iter() if is_html_element(element, tag)]
+
+
+def append_html_text(element: ET.Element, text: str) -> None:
+    if not text:
+        return
+    if len(element):
+        last_child = element[-1]
+        last_child.tail = (last_child.tail or "") + text
+    else:
+        element.text = (element.text or "") + text
+
+
+class LenientHtmlTreeBuilder(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.document = ET.Element("__document__")
+        self.stack: list[ET.Element] = [self.document]
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        element = ET.Element(tag, {key: value or "" for key, value in attrs})
+        self.stack[-1].append(element)
+        if tag not in HTML_VOID_TAGS:
+            self.stack.append(element)
+
+    def handle_startendtag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        element = ET.Element(tag, {key: value or "" for key, value in attrs})
+        self.stack[-1].append(element)
+
+    def handle_endtag(self, tag: str) -> None:
+        for index in range(len(self.stack) - 1, 0, -1):
+            if self.stack[index].tag == tag:
+                del self.stack[index:]
+                return
+
+    def handle_data(self, data: str) -> None:
+        append_html_text(self.stack[-1], data)
+
+
+def parse_markup_document(raw: bytes, source_name: str) -> ET.Element:
+    try:
+        return ET.fromstring(raw)
+    except ET.ParseError:
+        parser = LenientHtmlTreeBuilder()
+        parser.feed(raw.decode("utf-8", errors="replace"))
+        parser.close()
+        root = next(iter(parser.document), None)
+        if root is None:
+            raise AlignmentError(f"Could not parse document: {source_name}")
+        return root
+
+
+def load_env_file(path: Path) -> None:
+    if not path.exists() or not path.is_file():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        value = value.strip()
+        if value[:1] == value[-1:] and value[:1] in {'"', "'"}:
+            value = value[1:-1]
+        os.environ[key] = value
+
+
+def condense_excerpt(text: str, limit: int = DEFAULT_CHAPTER_EXCERPT_CHAR_LIMIT) -> str:
+    normalized = normalize_text(text)
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 3].rstrip() + "..."
+
+
+def normalize_epub_archive_path(path: str) -> str:
+    normalized = str(path).replace("\\", "/").strip()
+    if not normalized:
+        return ""
+    normalized = posixpath.normpath(normalized)
+    if normalized == ".":
+        return ""
+    return normalized.lstrip("/")
+
+
+def epub_path_name(path: str) -> str:
+    normalized = normalize_epub_archive_path(path) or str(path).replace("\\", "/")
+    return PurePosixPath(normalized).name
+
+
+def epub_path_stem(path: str) -> str:
+    normalized = normalize_epub_archive_path(path) or str(path).replace("\\", "/")
+    return PurePosixPath(normalized).stem
 
 
 def default_cleanup_config() -> dict:
@@ -598,16 +817,11 @@ def paragraph_from_text(source_index: int, text: str) -> Paragraph:
 
 
 def extract_title_from_document(document: ET.Element, fallback: str) -> str:
-    body = document.find(f".//{html_qname('body')}")
+    body = find_first_html_element(document, "body")
     if body is not None:
         leading_headings: list[str] = []
         for child in list(body):
-            tag = child.tag
-            if tag in {
-                html_qname("h1"),
-                html_qname("h2"),
-                html_qname("h3"),
-            }:
+            if is_html_element(child, "h1") or is_html_element(child, "h2") or is_html_element(child, "h3"):
                 text = normalize_text("".join(child.itertext()))
                 if text:
                     leading_headings.append(text)
@@ -623,7 +837,7 @@ def extract_title_from_document(document: ET.Element, fallback: str) -> str:
             return ": ".join(leading_headings)
 
     for tag in ("h1", "h2", "h3", "title"):
-        element = document.find(f".//{html_qname(tag)}")
+        element = find_first_html_element(document, tag)
         if element is None:
             continue
         text = normalize_text("".join(element.itertext()))
@@ -636,7 +850,15 @@ def normalize_epub_href(base_dir: str, ref: str) -> str | None:
     target = ref.split("#", 1)[0].strip()
     if not target:
         return None
-    return os.path.normpath(os.path.join(base_dir, target))
+    if target.startswith(("/", "\\")):
+        normalized = normalize_epub_archive_path(target)
+    else:
+        normalized_base_dir = normalize_epub_archive_path(base_dir)
+        normalized_target = normalize_epub_archive_path(target)
+        normalized = normalize_epub_archive_path(
+            posixpath.join(normalized_base_dir, normalized_target)
+        )
+    return normalized or None
 
 
 def extract_nav_titles_from_nav_document(
@@ -644,15 +866,16 @@ def extract_nav_titles_from_nav_document(
     nav_dir: str,
 ) -> dict[str, str]:
     titles: dict[str, str] = {}
-    for nav in document.findall(f".//{html_qname('nav')}"):
+    for nav in find_all_html_elements(document, "nav"):
         nav_type = (
             nav.attrib.get(f"{{{EPUB_NS}}}type")
+            or nav.attrib.get("epub:type")
             or nav.attrib.get("type")
             or ""
         )
         if "toc" not in nav_type.casefold():
             continue
-        for anchor in nav.findall(f".//{html_qname('a')}"):
+        for anchor in find_all_html_elements(nav, "a"):
             href = anchor.attrib.get("href", "")
             normalized_href = normalize_epub_href(nav_dir, href)
             if not normalized_href:
@@ -694,11 +917,11 @@ def extract_epub_navigation_titles(
         full_path = normalize_epub_href(opf_dir, href)
         if not full_path:
             continue
-        nav_dir = os.path.dirname(full_path)
+        nav_dir = posixpath.dirname(full_path)
 
         if "nav" in item.attrib.get("properties", "").split():
             try:
-                document = ET.fromstring(archive.read(full_path))
+                document = parse_markup_document(archive.read(full_path), full_path)
             except KeyError:
                 continue
             titles.update(extract_nav_titles_from_nav_document(document, nav_dir))
@@ -706,7 +929,7 @@ def extract_epub_navigation_titles(
 
         if media_type == "application/x-dtbncx+xml":
             try:
-                document = ET.fromstring(archive.read(full_path))
+                document = parse_markup_document(archive.read(full_path), full_path)
             except KeyError:
                 continue
             for normalized_href, text in extract_nav_titles_from_ncx(
@@ -719,15 +942,12 @@ def extract_epub_navigation_titles(
 
 
 def extract_xhtml_paragraphs(root: ET.Element) -> list[Paragraph]:
-    body = root.find(f".//{html_qname('body')}")
+    body = find_first_html_element(root, "body")
     if body is None:
         return []
 
     paragraphs: list[Paragraph] = []
-    for source_index, paragraph in enumerate(
-        body.findall(f".//{html_qname('p')}"),
-        start=1,
-    ):
+    for source_index, paragraph in enumerate(find_all_html_elements(body, "p"), start=1):
         text = normalize_text("".join(paragraph.itertext()))
         paragraphs.append(
             Paragraph(
@@ -757,7 +977,7 @@ def non_main_chapter_reason(
         return "non_main_content"
     if cleanup_rules.non_main_title_contains_re.search(title):
         return "non_main_content"
-    href_name = Path(href).name
+    href_name = epub_path_name(href)
     if href_name and cleanup_rules.epub_non_main_file_re.search(href_name):
         return "non_main_content"
     normalized_title = normalize_text(title).casefold()
@@ -769,7 +989,7 @@ def non_main_chapter_reason(
         and paragraph_count <= 20
     ):
         return "non_main_content"
-    if normalized_title == Path(href).stem.casefold() and paragraph_count <= 3:
+    if normalized_title == epub_path_stem(href).casefold() and paragraph_count <= 3:
         return "non_main_content"
     return None
 
@@ -948,8 +1168,10 @@ def load_epub_book(path: Path, cleanup_rules: CleanupRules) -> Book:
         if rootfile is None:
             raise AlignmentError(f"Could not find OPF path in {path}")
 
-        opf_path = rootfile.attrib["full-path"]
-        opf_dir = os.path.dirname(opf_path)
+        opf_path = normalize_epub_archive_path(rootfile.attrib["full-path"])
+        if not opf_path:
+            raise AlignmentError(f"Could not find OPF path in {path}")
+        opf_dir = posixpath.dirname(opf_path)
         package = ET.fromstring(archive.read(opf_path))
         ns = {"opf": OPF_NS, "dc": DC_NS}
 
@@ -973,12 +1195,14 @@ def load_epub_book(path: Path, cleanup_rules: CleanupRules) -> Book:
             if item.get("media-type") not in {"application/xhtml+xml", "text/html"}:
                 continue
 
-            href = os.path.normpath(os.path.join(opf_dir, item["href"]))
-            document = ET.fromstring(archive.read(href))
+            href = normalize_epub_href(opf_dir, item["href"])
+            if not href:
+                continue
+            document = parse_markup_document(archive.read(href), href)
             raw_paragraphs = extract_xhtml_paragraphs(document)
             chapter_title = nav_titles.get(href) or extract_title_from_document(
                 document,
-                Path(href).stem,
+                epub_path_stem(href),
             )
             chapter = build_chapter(
                 order=len(chapters) + 1,
@@ -1113,8 +1337,8 @@ def load_plain_text_book(
 
 
 def load_html_book(path: Path, cleanup_rules: CleanupRules) -> Book:
-    document = ET.fromstring(path.read_bytes())
-    body = document.find(f".//{html_qname('body')}")
+    document = parse_markup_document(path.read_bytes(), str(path))
+    body = find_first_html_element(document, "body")
     if body is None:
         raise AlignmentError(f"No <body> found in {path}")
 
@@ -1192,6 +1416,164 @@ def load_book(path: Path, cleanup_rules: CleanupRules) -> Book:
     )
 
 
+def normalize_chapter_pair_entry(pair: dict) -> dict:
+    a_hrefs = pair.get("a_hrefs")
+    b_hrefs = pair.get("b_hrefs")
+    if a_hrefs is None and "a_href" in pair:
+        a_hrefs = [pair["a_href"]]
+    if b_hrefs is None and "b_href" in pair:
+        b_hrefs = [pair["b_href"]]
+    if not isinstance(a_hrefs, list) or not all(isinstance(item, str) for item in a_hrefs):
+        raise AlignmentError("Each chapter pair must define a_hrefs as a list of strings.")
+    if not isinstance(b_hrefs, list) or not all(isinstance(item, str) for item in b_hrefs):
+        raise AlignmentError("Each chapter pair must define b_hrefs as a list of strings.")
+    if not a_hrefs or not b_hrefs:
+        raise AlignmentError("Each chapter pair must include at least one chapter on both sides.")
+    normalized = {
+        "id": str(pair.get("id") or ""),
+        "a_hrefs": a_hrefs,
+        "b_hrefs": b_hrefs,
+        "title": str(pair.get("title") or ""),
+    }
+    if "alignments" in pair:
+        normalized["alignments"] = pair["alignments"]
+    return normalized
+
+
+def chapter_range_label(chapters: list[Chapter]) -> str:
+    if not chapters:
+        return "Unknown"
+    if len(chapters) == 1:
+        return chapters[0].title
+    return f"{chapters[0].title} .. {chapters[-1].title}"
+
+
+def chapter_index_label(indices: list[int]) -> str:
+    if not indices:
+        return "?"
+    if len(indices) == 1:
+        return str(indices[0])
+    if indices == list(range(indices[0], indices[-1] + 1)):
+        return f"{indices[0]}-{indices[-1]}"
+    return ",".join(str(index) for index in indices)
+
+
+def looks_like_section_divider(chapter: Chapter) -> bool:
+    if chapter.paragraph_count > 3:
+        return False
+    title = normalize_text(chapter.title)
+    if not title:
+        return False
+    if not SECTION_DIVIDER_TITLE_RE.search(title):
+        return False
+    return all(len(normalize_text(paragraph.text)) <= 120 for paragraph in chapter.paragraphs)
+
+
+def heuristic_chapter_label(
+    book: Book,
+    chapter: Chapter,
+    cleanup_rules: CleanupRules,
+) -> str:
+    title = normalize_text(chapter.title)
+    lowered = title.casefold()
+    if looks_like_section_divider(chapter):
+        return "section_divider"
+    if PREVIEW_TITLE_RE.search(title):
+        return "preview_skip"
+    if chapter.order == len(book.chapters) and chapter.paragraph_count <= 40:
+        previous_title = normalize_text(book.chapters[-2].title).casefold() if len(book.chapters) >= 2 else ""
+        if "continue reading" in previous_title or "preview" in previous_title:
+            return "preview_skip"
+    reason = non_main_chapter_reason(
+        chapter.title,
+        cleanup_rules,
+        href=chapter.href,
+        paragraph_count=chapter.paragraph_count,
+        book_title=book.title,
+    )
+    if reason == "non_main_content":
+        if chapter.order <= max(3, len(book.chapters) // 4):
+            return "frontmatter_skip"
+        if PREVIEW_TITLE_RE.search(title) or "preview" in lowered:
+            return "preview_skip"
+        return "backmatter_skip"
+    if chapter.order <= max(2, len(book.chapters) // 6) and chapter.paragraph_count <= 8:
+        if "author" in lowered or "简介" in lowered or "人物" in lowered:
+            return "frontmatter_skip"
+    first_section_divider_order = next(
+        (item.order for item in book.chapters if looks_like_section_divider(item)),
+        None,
+    )
+    if (
+        first_section_divider_order is not None
+        and chapter.order < first_section_divider_order
+        and chapter.paragraph_count <= 25
+    ):
+        short_preface_count = sum(
+            1
+            for item in book.chapters[: first_section_divider_order - 1]
+            if item.paragraph_count <= 25
+        )
+        if short_preface_count >= 2:
+            return "frontmatter_skip"
+    return "main"
+
+
+def fixed_structural_label(
+    book: Book,
+    chapter: Chapter,
+    cleanup_rules: CleanupRules,
+) -> str | None:
+    label = heuristic_chapter_label(book, chapter, cleanup_rules)
+    return None if label == "main" else label
+
+
+def build_chapter_group(
+    pair: dict,
+    side: str,
+    chapters_by_href: dict[str, Chapter],
+) -> ChapterGroup:
+    hrefs = pair[f"{side}_hrefs"]
+    source_chapters = [chapters_by_href[href] for href in hrefs]
+    paragraphs: list[Paragraph] = []
+    trailing_notes: list[Paragraph] = []
+    removed: list[RemovedParagraph] = []
+    paragraph_index = 1
+    note_index = 1
+    for chapter in source_chapters:
+        for paragraph in chapter.paragraphs:
+            paragraphs.append(
+                Paragraph(
+                    index=paragraph_index,
+                    source_index=paragraph.source_index,
+                    html=paragraph.html,
+                    text=paragraph.text,
+                )
+            )
+            paragraph_index += 1
+        for paragraph in chapter.trailing_note_paragraphs:
+            trailing_notes.append(
+                Paragraph(
+                    index=note_index,
+                    source_index=paragraph.source_index,
+                    html=paragraph.html,
+                    text=paragraph.text,
+                )
+            )
+            note_index += 1
+        removed.extend(chapter.removed_paragraphs)
+
+    title = pair.get("title") or chapter_range_label(source_chapters)
+    return ChapterGroup(
+        title=title,
+        hrefs=hrefs,
+        paragraphs=paragraphs,
+        trailing_note_paragraphs=trailing_notes,
+        removed_paragraphs=removed,
+        source_chapters=source_chapters,
+    )
+
+
 def load_config(config_path: Path, label_a: str, label_b: str) -> dict:
     if config_path.exists():
         config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -1199,6 +1581,7 @@ def load_config(config_path: Path, label_a: str, label_b: str) -> dict:
         config = default_config(label_a, label_b)
     config.setdefault("version", 1)
     config.setdefault("chapter_pairs", [])
+    config.setdefault("semantic_chapter_mapping", None)
     existing_a, existing_b = get_config_language_names(config)
     set_config_language_names(
         config,
@@ -1286,11 +1669,793 @@ def inspect_books(book_a: Book, book_b: Book) -> None:
         print()
 
 
+def chapter_directory_payload(
+    book: Book,
+    cleanup_rules: CleanupRules,
+) -> dict:
+    chapters: list[dict] = []
+    alignable_candidate_hrefs: list[str] = []
+    fixed_structural_hrefs = {
+        "frontmatter_skip": [],
+        "backmatter_skip": [],
+        "preview_skip": [],
+        "section_divider": [],
+    }
+    for chapter in book.chapters:
+        fixed_label = fixed_structural_label(book, chapter, cleanup_rules)
+        if fixed_label is None:
+            alignable_candidate_hrefs.append(chapter.href)
+        else:
+            fixed_structural_hrefs[fixed_label].append(chapter.href)
+        chapters.append(
+            {
+                "index": chapter.order,
+                "href": chapter.href,
+                "title": chapter.title,
+                "toc_title": chapter.title,
+                "paragraph_count": chapter.paragraph_count,
+                "fixed_label": fixed_label,
+            }
+        )
+    return {
+        "title": book.title,
+        "language": book.language,
+        "alignable_candidate_hrefs": alignable_candidate_hrefs,
+        "full_span_hint": [
+            alignable_candidate_hrefs[0],
+            alignable_candidate_hrefs[-1],
+        ] if alignable_candidate_hrefs else [],
+        "fixed_structural_hrefs": fixed_structural_hrefs,
+        "chapters": chapters,
+    }
+
+
+def opening_excerpt_payload(chapter: Chapter) -> dict:
+    return {
+        "index": chapter.order,
+        "href": chapter.href,
+        "title": chapter.title,
+        "opening_paragraphs": [
+            condense_excerpt(paragraph.text)
+            for paragraph in chapter.paragraphs[:DEFAULT_CHAPTER_EXCERPT_COUNT]
+        ],
+    }
+
+
+def chapter_mapping_iteration_response_schema() -> dict:
+    mapping_unit_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "id",
+            "a_hrefs",
+            "b_hrefs",
+            "relation",
+            "confidence",
+            "evidence",
+        ],
+        "properties": {
+            "id": {"type": "string", "minLength": 1},
+            "a_hrefs": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string", "minLength": 1},
+            },
+            "b_hrefs": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string", "minLength": 1},
+            },
+            "relation": {
+                "type": "string",
+                "enum": ["1:1", "1:N", "N:1", "N:N"],
+            },
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "evidence": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 5,
+                "items": {"type": "string"},
+            },
+        },
+    }
+    info_request_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["request_id", "a_hrefs", "b_hrefs", "reason"],
+        "properties": {
+            "request_id": {"type": "string", "minLength": 1},
+            "a_hrefs": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 3,
+                "items": {"type": "string", "minLength": 1},
+            },
+            "b_hrefs": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 3,
+                "items": {"type": "string", "minLength": 1},
+            },
+            "reason": {"type": "string", "minLength": 1},
+        },
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "status",
+            "continuous_main_text",
+            "main_text_range",
+            "mapping_units",
+            "info_request",
+        ],
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["request_more_info", "resolved"],
+            },
+            "continuous_main_text": {"type": "boolean"},
+            "main_text_range": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["a", "b"],
+                "properties": {
+                    "a": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "items": {"type": "string", "minLength": 1},
+                    },
+                    "b": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "items": {"type": "string", "minLength": 1},
+                    },
+                },
+            },
+            "mapping_units": {"type": "array", "items": mapping_unit_schema},
+            "info_request": {
+                "anyOf": [
+                    info_request_schema,
+                    {"type": "null"},
+                ]
+            },
+        },
+    }
+
+
+def build_chapter_mapping_prompt(
+    payload: dict,
+    previous_output: str = "",
+    validation_error: str = "",
+) -> str:
+    lines = [
+        "Resolve the chapter mapping between book A and book B.",
+        "Return JSON matching the required schema.",
+        "Priority:",
+        "1. Use chapter-directory semantics first: raw titles and local order progression.",
+        "2. Assume mismatches are usually local adjacent split/merge cases, not global reshuffles.",
+        "3. Find whether there is one continuous main-text span in both books.",
+        "4. Work strictly from left to right. Lock in the earliest confirmed prefix first.",
+        "5. If the directory alone supports a clear 1:1 continuation, extend the confirmed prefix immediately.",
+        "6. Do not leave the confirmed prefix empty if the left edge is already clear from the directory.",
+        "7. If the next local region is ambiguous, return status=request_more_info and request exactly one smallest local window for that earliest ambiguity.",
+        "8. After supplemental openings are provided, settle that local ambiguity, extend the confirmed prefix, and only then continue.",
+        "",
+        "Hard rules:",
+        "- If fixed_label is not null, that chapter is structural and must not appear in mapping_units or info_request.",
+        "- main_text_range boundaries must come from alignable_candidate_hrefs.",
+        "- main_text_range must cover the full continuous alignable narrative span, which is usually the provided full_span_hint.",
+        "- Every href in mapping_units and info_request must come from alignable_candidate_hrefs.",
+        "- Within each mapping unit, keep chapter hrefs contiguous on each side.",
+        "- locked_mapping_units are immutable and must appear as the exact prefix of mapping_units.",
+        "- When the left edge is clear, mapping_units must include that clear confirmed prefix before requesting more info.",
+        "- If supplemental_openings is empty, only finalize if the directory alone supports a clean 1:1 mapping across the whole span.",
+        "- If you suspect any 1:N, N:1, or N:N mapping, request more info first instead of guessing from the directory.",
+        "- Only emit a grouped mapping (1:N, N:1, N:N) when that exact local region is directly grounded by supplemental openings already present in the input.",
+        "- In status=request_more_info, mapping_units must contain only the confirmed prefix and info_request must be a single earliest ambiguous local window.",
+        "- In status=resolved, info_request must be null and mapping_units must contain the full final mapping.",
+        "- Do not request a href if supplemental openings for that href are already present in the input.",
+        "- In the final resolved mapping, cover every alignable chapter inside the chosen main_text_range exactly once.",
+        "",
+        "Input JSON:",
+        json.dumps(payload, ensure_ascii=False),
+    ]
+    if validation_error:
+        repair_lines = [
+            "",
+            "Your previous output was invalid.",
+            f"Validation error: {validation_error}",
+            "Repair the output so that all hrefs exist in the input, remain monotonic, and do not overlap.",
+        ]
+        if "locked mapping unit" in validation_error:
+            repair_lines.extend(
+                [
+                    "- You changed an already confirmed prefix mapping. Restore it exactly.",
+                    "- Continue only from the earliest unresolved local boundary after that locked prefix.",
+                ]
+            )
+        if "Directory-only semantic resolution must request more info" in validation_error:
+            repair_lines.extend(
+                [
+                    "- Directory-only resolution may not guess grouped mappings.",
+                    "- Switch to status=request_more_info and ask for the earliest grouped local window.",
+                ]
+            )
+        if "grouped mapping that is not directly supported" in validation_error:
+            repair_lines.extend(
+                [
+                    "- A grouped mapping was emitted without direct opening support.",
+                    "- Request more info for that exact local grouped region instead of guessing.",
+                ]
+            )
+        if "left uncovered main-text chapters" in validation_error:
+            uncovered_payload = validation_error.split(": ", 1)[1] if ": " in validation_error else ""
+            repair_lines.extend(
+                [
+                    "- Your resolved mapping left chapters inside main_text_range uncovered.",
+                    "- Either extend mapping_units to cover them or switch to status=request_more_info.",
+                    "- If more evidence is needed, request the single smallest earliest unresolved local window instead of returning resolved.",
+                ]
+            )
+            if uncovered_payload:
+                repair_lines.append(f"- Uncovered hrefs: {uncovered_payload}")
+                repair_lines.append(
+                    "- Use the earliest uncovered href on each side as the next unresolved boundary."
+                )
+        if "confirmed prefix" in validation_error or "earliest unresolved" in validation_error:
+            repair_lines.extend(
+                [
+                    "- In request_more_info, mapping_units must be only the confirmed prefix from the start of the range.",
+                    "- info_request must start at the earliest unresolved chapter on both sides.",
+                ]
+            )
+        lines.extend(repair_lines)
+    if previous_output:
+        lines.extend(
+            [
+                "",
+                "Previous invalid JSON output:",
+                previous_output,
+            ]
+        )
+    return "\n".join(lines)
+
+
+def chapter_resolver_debug_enabled() -> bool:
+    return os.getenv("CHAPTER_RESOLVER_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def log_chapter_resolver_debug(message: str) -> None:
+    if chapter_resolver_debug_enabled():
+        print(f"[chapter-resolver] {message}")
+
+
+def semantic_labels_for_book(
+    book: Book,
+    cleanup_rules: CleanupRules,
+) -> dict[str, str]:
+    labels: dict[str, str] = {}
+    for chapter in book.chapters:
+        labels[chapter.href] = fixed_structural_label(book, chapter, cleanup_rules) or "main"
+    return labels
+
+
+def validate_semantic_main_text_range(
+    result: dict,
+    books: dict[str, Book],
+    href_to_order: dict[str, dict[str, int]],
+    labels_by_side: dict[str, dict[str, str]],
+) -> None:
+    for side in ("a", "b"):
+        start_href, end_href = result["main_text_range"][side]
+        start_order = href_to_order[side].get(start_href)
+        end_order = href_to_order[side].get(end_href)
+        if start_order is None or end_order is None or end_order < start_order:
+            raise AlignmentError(f"Invalid main_text_range for source {side.upper()}.")
+        if labels_by_side[side][start_href] != "main" or labels_by_side[side][end_href] != "main":
+            raise AlignmentError(
+                f"Semantic resolver chose a structural chapter as a main-text boundary for source {side.upper()}."
+            )
+        main_hrefs = [
+            chapter.href
+            for chapter in books[side].chapters
+            if labels_by_side[side][chapter.href] == "main"
+        ]
+        if not main_hrefs:
+            raise AlignmentError(f"Source {side.upper()} has no alignable main chapters.")
+        expected_range = [main_hrefs[0], main_hrefs[-1]]
+        if [start_href, end_href] != expected_range:
+            raise AlignmentError(
+                f"Semantic resolver returned an incomplete main_text_range for source {side.upper()}. "
+                f"Expected {expected_range}, got {[start_href, end_href]}."
+            )
+
+
+def collect_requested_opening_context(
+    info_request: dict,
+    book_a: Book,
+    book_b: Book,
+) -> dict:
+    return {
+        "request_id": info_request["request_id"],
+        "reason": info_request["reason"],
+        "a_chapters": [
+            opening_excerpt_payload(book_a.chapters_by_href[href])
+            for href in info_request["a_hrefs"]
+        ],
+        "b_chapters": [
+            opening_excerpt_payload(book_b.chapters_by_href[href])
+            for href in info_request["b_hrefs"]
+        ],
+    }
+
+
+def semantic_required_main_href_sequence(result: dict, book: Book, side: str) -> list[str]:
+    start_href, end_href = result["main_text_range"][side]
+    href_to_order = {chapter.href: chapter.order for chapter in book.chapters}
+    start_order = href_to_order[start_href]
+    end_order = href_to_order[end_href]
+    labels = result.get("labels_by_side", {}).get(side, {})
+    return [
+        chapter.href
+        for chapter in book.chapters[start_order - 1 : end_order]
+        if labels.get(chapter.href, "main") == "main"
+    ]
+
+
+def validate_semantic_mapping_units(
+    result: dict,
+    book_a: Book,
+    book_b: Book,
+    cleanup_rules: CleanupRules,
+    locked_mapping_units: list[dict] | None = None,
+    require_directory_only_one_to_one: bool = False,
+    supplemental_opening_bundles: list[dict] | None = None,
+) -> dict:
+    books = {"a": book_a, "b": book_b}
+    href_to_order = {
+        side: {chapter.href: chapter.order for chapter in book.chapters}
+        for side, book in books.items()
+    }
+    labels_by_side = {
+        "a": semantic_labels_for_book(book_a, cleanup_rules),
+        "b": semantic_labels_for_book(book_b, cleanup_rules),
+    }
+    validate_semantic_main_text_range(result, books, href_to_order, labels_by_side)
+
+    locked_mapping_units = locked_mapping_units or []
+    if len(result["mapping_units"]) < len(locked_mapping_units):
+        raise AlignmentError("Semantic resolver truncated a locked mapping unit prefix.")
+
+    seen_a: set[str] = set()
+    seen_b: set[str] = set()
+    previous_a = 0
+    previous_b = 0
+    normalized_pairs: list[dict] = []
+    for index, unit in enumerate(result["mapping_units"], start=1):
+        if index <= len(locked_mapping_units):
+            locked_unit = locked_mapping_units[index - 1]
+            if unit["a_hrefs"] != locked_unit["a_hrefs"] or unit["b_hrefs"] != locked_unit["b_hrefs"]:
+                raise AlignmentError("Semantic resolver changed a locked mapping unit.")
+
+        a_hrefs = unit["a_hrefs"]
+        b_hrefs = unit["b_hrefs"]
+        try:
+            a_orders = [href_to_order["a"][href] for href in a_hrefs]
+            b_orders = [href_to_order["b"][href] for href in b_hrefs]
+        except KeyError as exc:
+            raise AlignmentError(
+                f"Semantic resolver returned an unknown chapter href: {exc.args[0]}"
+            ) from exc
+        if a_orders != sorted(a_orders) or b_orders != sorted(b_orders):
+            raise AlignmentError("Semantic resolver returned non-monotonic mapping hrefs.")
+        if a_orders != list(range(a_orders[0], a_orders[-1] + 1)) or b_orders != list(
+            range(b_orders[0], b_orders[-1] + 1)
+        ):
+            raise AlignmentError(
+                "Semantic resolver returned a mapping unit with non-contiguous chapters."
+            )
+        if any(item in seen_a for item in a_hrefs) or any(item in seen_b for item in b_hrefs):
+            raise AlignmentError("Semantic resolver returned overlapping mapping hrefs.")
+        if a_orders[0] <= previous_a or b_orders[0] <= previous_b:
+            raise AlignmentError("Semantic resolver returned out-of-order mapping units.")
+        if any(labels_by_side["a"][href] != "main" for href in a_hrefs) or any(
+            labels_by_side["b"][href] != "main" for href in b_hrefs
+        ):
+            raise AlignmentError(
+                "Semantic resolver referenced a structural chapter inside mapping_units."
+            )
+
+        range_a = result["main_text_range"]["a"]
+        range_b = result["main_text_range"]["b"]
+        if (
+            a_orders[0] < href_to_order["a"][range_a[0]]
+            or a_orders[-1] > href_to_order["a"][range_a[1]]
+            or b_orders[0] < href_to_order["b"][range_b[0]]
+            or b_orders[-1] > href_to_order["b"][range_b[1]]
+        ):
+            raise AlignmentError(
+                "Semantic resolver returned mapping_units outside the selected main_text_range."
+            )
+
+        previous_a = a_orders[-1]
+        previous_b = b_orders[-1]
+        seen_a.update(a_hrefs)
+        seen_b.update(b_hrefs)
+        title = (
+            f"{chapter_range_label([book_a.chapters[order - 1] for order in a_orders])} / "
+            f"{chapter_range_label([book_b.chapters[order - 1] for order in b_orders])}"
+        )
+        normalized_pairs.append(
+            {
+                "id": unit["id"] or f"chapter-{index:02d}",
+                "a_hrefs": a_hrefs,
+                "b_hrefs": b_hrefs,
+                "title": title,
+                "alignments": [],
+                "semantic_relation": unit["relation"],
+                "semantic_confidence": unit["confidence"],
+                "semantic_evidence": unit["evidence"],
+            }
+        )
+
+    if require_directory_only_one_to_one and any(
+        len(pair["a_hrefs"]) != 1 or len(pair["b_hrefs"]) != 1
+        for pair in normalized_pairs
+    ):
+        raise AlignmentError(
+            "Directory-only semantic resolution must request more info before using grouped chapter mappings."
+        )
+    if supplemental_opening_bundles:
+        bundle_windows = [
+            (
+                {chapter["href"] for chapter in bundle["a_chapters"]},
+                {chapter["href"] for chapter in bundle["b_chapters"]},
+            )
+            for bundle in supplemental_opening_bundles
+        ]
+        for pair in normalized_pairs:
+            if len(pair["a_hrefs"]) == 1 and len(pair["b_hrefs"]) == 1:
+                continue
+            if not any(
+                set(pair["a_hrefs"]).issubset(a_hrefs)
+                and set(pair["b_hrefs"]).issubset(b_hrefs)
+                for a_hrefs, b_hrefs in bundle_windows
+            ):
+                raise AlignmentError(
+                    "Semantic resolver emitted a grouped mapping that is not directly supported by any supplied opening window."
+                )
+
+    result["labels_by_side"] = labels_by_side
+    result["normalized_pairs"] = normalized_pairs
+    result["href_to_order"] = href_to_order
+    return result
+
+
+def next_uncovered_main_href(required_hrefs: list[str], covered_hrefs: set[str], side: str) -> str | None:
+    gap_found = False
+    next_href = None
+    for href in required_hrefs:
+        if href in covered_hrefs:
+            if gap_found:
+                raise AlignmentError(
+                    f"Semantic resolver returned a non-prefix confirmed mapping for source {side.upper()}."
+                )
+            continue
+        if next_href is None:
+            next_href = href
+        gap_found = True
+    return next_href
+
+
+def validate_semantic_info_request(
+    result: dict,
+    book_a: Book,
+    book_b: Book,
+    cleanup_rules: CleanupRules,
+    provided_opening_hrefs: dict[str, set[str]],
+    locked_mapping_units: list[dict] | None = None,
+    require_directory_only_one_to_one: bool = False,
+    supplemental_opening_bundles: list[dict] | None = None,
+) -> dict:
+    if result["status"] != "request_more_info":
+        raise AlignmentError("Semantic resolver returned an unexpected non-request status.")
+    if result["info_request"] is None:
+        raise AlignmentError("Semantic resolver requested more info without specifying a chapter window.")
+
+    result = validate_semantic_mapping_units(
+        result,
+        book_a,
+        book_b,
+        cleanup_rules,
+        locked_mapping_units=locked_mapping_units,
+        require_directory_only_one_to_one=require_directory_only_one_to_one,
+        supplemental_opening_bundles=supplemental_opening_bundles,
+    )
+
+    required_a = semantic_required_main_href_sequence(result, book_a, "a")
+    required_b = semantic_required_main_href_sequence(result, book_b, "b")
+    covered_a = {href for pair in result["normalized_pairs"] for href in pair["a_hrefs"]}
+    covered_b = {href for pair in result["normalized_pairs"] for href in pair["b_hrefs"]}
+    next_a = next_uncovered_main_href(required_a, covered_a, "a")
+    next_b = next_uncovered_main_href(required_b, covered_b, "b")
+    if next_a is None and next_b is None:
+        raise AlignmentError(
+            "Semantic resolver requested more info even though the confirmed prefix already covers the full main_text_range."
+        )
+    if next_a is None or next_b is None:
+        raise AlignmentError(
+            "Semantic resolver produced an invalid confirmed prefix that does not stop at a shared earliest unresolved boundary."
+        )
+
+    request = result["info_request"]
+    if request["a_hrefs"][0] != next_a or request["b_hrefs"][0] != next_b:
+        raise AlignmentError(
+            "Semantic resolver did not request the earliest unresolved local window after the confirmed prefix."
+        )
+
+    href_to_order = result["href_to_order"]
+    labels_by_side = result["labels_by_side"]
+    for side, hrefs in (("a", request["a_hrefs"]), ("b", request["b_hrefs"])):
+        try:
+            orders = [href_to_order[side][href] for href in hrefs]
+        except KeyError as exc:
+            raise AlignmentError(
+                f"Semantic resolver requested an unknown chapter href: {exc.args[0]}"
+            ) from exc
+        if any(labels_by_side[side][href] != "main" for href in hrefs):
+            raise AlignmentError(
+                "Semantic resolver requested structural chapters for supplemental openings."
+            )
+        if orders != sorted(orders) or orders != list(range(orders[0], orders[-1] + 1)):
+            raise AlignmentError("Semantic resolver requested a non-contiguous chapter window.")
+        range_start, range_end = result["main_text_range"][side]
+        if orders[0] < href_to_order[side][range_start] or orders[-1] > href_to_order[side][range_end]:
+            raise AlignmentError(
+                "Semantic resolver requested chapters outside the selected main_text_range."
+            )
+    if all(href in provided_opening_hrefs["a"] for href in request["a_hrefs"]) and all(
+        href in provided_opening_hrefs["b"] for href in request["b_hrefs"]
+    ):
+        raise AlignmentError(
+            "Semantic resolver re-requested chapter openings that were already provided."
+        )
+    return result
+
+
+def extract_response_output_text(response: object) -> str:
+    output_text = getattr(response, "output_text", "")
+    if output_text:
+        return str(output_text)
+    output = getattr(response, "output", None)
+    if output:
+        parts: list[str] = []
+        for item in output:
+            content = getattr(item, "content", None)
+            if not content:
+                continue
+            for part in content:
+                text = getattr(part, "text", "")
+                if text:
+                    parts.append(str(text))
+        if parts:
+            return "".join(parts)
+    raise AlignmentError("OpenAI response did not contain any structured output text.")
+
+
+def create_openai_client() -> object:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise AlignmentError(
+            "OPENAI_API_KEY is not set. Add it to .env or your shell environment."
+        )
+    try:
+        from openai import OpenAI
+    except ModuleNotFoundError as exc:
+        raise AlignmentError(
+            "The 'openai' package is required for semantic chapter mapping. "
+            "Run `python -m pip install .[semantic]` to install it."
+        ) from exc
+
+    client_kwargs = {
+        "api_key": api_key,
+        "timeout": float(
+            os.getenv(
+                "OPENAI_CHAPTER_MAPPING_TIMEOUT",
+                str(DEFAULT_CHAPTER_RESOLVER_TIMEOUT_SECONDS),
+            )
+        ),
+    }
+    base_url = os.getenv("OPENAI_BASE_URL", "").strip()
+    if base_url:
+        client_kwargs["base_url"] = base_url
+    return OpenAI(**client_kwargs)
+
+
+def validate_semantic_resolution(
+    result: dict,
+    book_a: Book,
+    book_b: Book,
+    cleanup_rules: CleanupRules,
+    locked_mapping_units: list[dict] | None = None,
+    require_directory_only_one_to_one: bool = False,
+    supplemental_opening_bundles: list[dict] | None = None,
+) -> dict:
+    if result["status"] != "resolved":
+        raise AlignmentError("Semantic resolver did not return a final resolved mapping.")
+    if result["info_request"] is not None:
+        raise AlignmentError("Semantic resolver returned info_request in a resolved mapping.")
+
+    result = validate_semantic_mapping_units(
+        result,
+        book_a,
+        book_b,
+        cleanup_rules,
+        locked_mapping_units=locked_mapping_units,
+        require_directory_only_one_to_one=require_directory_only_one_to_one,
+        supplemental_opening_bundles=supplemental_opening_bundles,
+    )
+
+    required_a = semantic_required_main_href_sequence(result, book_a, "a")
+    required_b = semantic_required_main_href_sequence(result, book_b, "b")
+    covered_a = {href for pair in result["normalized_pairs"] for href in pair["a_hrefs"]}
+    covered_b = {href for pair in result["normalized_pairs"] for href in pair["b_hrefs"]}
+    uncovered_a = [href for href in required_a if href not in covered_a]
+    uncovered_b = [href for href in required_b if href not in covered_b]
+    if uncovered_a or uncovered_b:
+        raise AlignmentError(
+            "Semantic resolver left uncovered main-text chapters: "
+            + json.dumps({"a": uncovered_a, "b": uncovered_b}, ensure_ascii=False)
+        )
+    return result
+
+
+def summarize_semantic_pairs(pairs: list[dict], book_a: Book, book_b: Book) -> list[str]:
+    href_to_index_a = {chapter.href: chapter.order for chapter in book_a.chapters}
+    href_to_index_b = {chapter.href: chapter.order for chapter in book_b.chapters}
+    lines: list[str] = []
+    for pair in pairs[:12]:
+        a_label = chapter_index_label([href_to_index_a[href] for href in pair["a_hrefs"]])
+        b_label = chapter_index_label([href_to_index_b[href] for href in pair["b_hrefs"]])
+        lines.append(f"A {a_label} -> B {b_label}")
+    if len(pairs) > 12:
+        lines.append(f"... ({len(pairs) - 12} more)")
+    return lines
+
+
+def resolve_chapter_pairs_with_llm(
+    book_a: Book,
+    book_b: Book,
+    cleanup_rules: CleanupRules,
+    config: dict,
+    model: str,
+) -> dict:
+    client = create_openai_client()
+    payload = {
+        "job_id": str(uuid.uuid4()),
+        "book_a": chapter_directory_payload(book_a, cleanup_rules),
+        "book_b": chapter_directory_payload(book_b, cleanup_rules),
+        "locked_mapping_units": [],
+        "supplemental_openings": [],
+        "constraints": {
+            "max_group_size_a": 3,
+            "max_group_size_b": 3,
+            "allow_frontmatter_skip": True,
+            "allow_backmatter_skip": True,
+            "allow_section_divider_merge": True,
+        },
+    }
+    provided_opening_hrefs = {"a": set(), "b": set()}
+    for round_index in range(1, DEFAULT_CHAPTER_RESOLVER_MAX_INFO_REQUEST_ROUNDS + 1):
+        previous_output = ""
+        validation_error = ""
+        log_chapter_resolver_debug(
+            f"round {round_index} start: locked={len(payload['locked_mapping_units'])} bundles={len(payload['supplemental_openings'])}"
+        )
+        for attempt in range(1, DEFAULT_CHAPTER_RESOLVER_MAX_ATTEMPTS + 1):
+            response = client.responses.create(
+                model=model,
+                temperature=0,
+                instructions=CHAPTER_RESOLVER_SYSTEM_PROMPT,
+                input=build_chapter_mapping_prompt(
+                    payload,
+                    previous_output=previous_output,
+                    validation_error=validation_error,
+                ),
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "chapter_mapping_resolution",
+                        "strict": True,
+                        "schema": chapter_mapping_iteration_response_schema(),
+                    }
+                },
+            )
+            previous_output = extract_response_output_text(response)
+            result = None
+            try:
+                result = json.loads(previous_output)
+                if result["status"] == "resolved":
+                    result = validate_semantic_resolution(
+                        result,
+                        book_a,
+                        book_b,
+                        cleanup_rules,
+                        locked_mapping_units=payload["locked_mapping_units"],
+                        require_directory_only_one_to_one=not payload["supplemental_openings"],
+                        supplemental_opening_bundles=payload["supplemental_openings"],
+                    )
+                else:
+                    result = validate_semantic_info_request(
+                        result,
+                        book_a,
+                        book_b,
+                        cleanup_rules,
+                        provided_opening_hrefs,
+                        locked_mapping_units=payload["locked_mapping_units"],
+                        require_directory_only_one_to_one=not payload["supplemental_openings"],
+                        supplemental_opening_bundles=payload["supplemental_openings"],
+                    )
+                log_chapter_resolver_debug(
+                    f"round {round_index} attempt {attempt}: status={result['status']} mapped={len(result['mapping_units'])}"
+                )
+            except (json.JSONDecodeError, AlignmentError) as exc:
+                validation_error = str(exc)
+                log_chapter_resolver_debug(
+                    f"round {round_index} attempt {attempt}: validation error: {validation_error}"
+                )
+                if previous_output:
+                    log_chapter_resolver_debug(f"round {round_index} attempt {attempt}: raw output: {previous_output}")
+                if attempt == DEFAULT_CHAPTER_RESOLVER_MAX_ATTEMPTS:
+                    raise AlignmentError(
+                        "Semantic chapter resolver returned invalid output after "
+                        f"{DEFAULT_CHAPTER_RESOLVER_MAX_ATTEMPTS} attempts in round {round_index}: {exc}"
+                    ) from exc
+                continue
+            break
+
+        if result is None:
+            continue
+        if result["status"] == "resolved":
+            config["semantic_chapter_mapping"] = result
+            config["chapter_pairs"] = result["normalized_pairs"]
+            return result
+
+        payload["locked_mapping_units"] = copy.deepcopy(result["mapping_units"])
+        opening_bundle = collect_requested_opening_context(
+            result["info_request"],
+            book_a,
+            book_b,
+        )
+        log_chapter_resolver_debug(
+            "requesting openings for "
+            f"A {chapter_index_label([book_a.chapters_by_href[item['href']].order for item in opening_bundle['a_chapters']])} "
+            f"vs B {chapter_index_label([book_b.chapters_by_href[item['href']].order for item in opening_bundle['b_chapters']])}"
+        )
+        payload["supplemental_openings"].append(opening_bundle)
+        provided_opening_hrefs["a"].update(
+            chapter["href"] for chapter in opening_bundle["a_chapters"]
+        )
+        provided_opening_hrefs["b"].update(
+            chapter["href"] for chapter in opening_bundle["b_chapters"]
+        )
+
+    raise AlignmentError(
+        "Semantic chapter resolver requested more information for too many rounds without converging."
+    )
+
+
 def resolve_chapter_pairs(
     book_a: Book,
     book_b: Book,
+    cleanup_rules: CleanupRules,
     config: dict,
     interactive: bool,
+    resolver_mode: str,
+    resolver_model: str,
 ) -> list[dict]:
     configured_pairs = config.get("chapter_pairs", [])
     if configured_pairs and not interactive:
@@ -1299,7 +2464,27 @@ def resolve_chapter_pairs(
         return validated
 
     if interactive and configured_pairs:
-        config["chapter_pairs"] = []
+        validated = validate_chapter_pairs(book_a, book_b, configured_pairs)
+        config["chapter_pairs"] = validated
+        return validated
+
+    should_use_llm = resolver_mode == "llm" or (
+        resolver_mode == "auto" and bool(os.getenv("OPENAI_API_KEY", "").strip())
+    )
+    if should_use_llm:
+        resolve_chapter_pairs_with_llm(
+            book_a,
+            book_b,
+            cleanup_rules,
+            config,
+            resolver_model,
+        )
+        summary = summarize_semantic_pairs(config["chapter_pairs"], book_a, book_b)
+        print(
+            f"Semantic chapter mapping generated with {resolver_model}: "
+            + "; ".join(summary)
+        )
+        return config["chapter_pairs"]
 
     if not interactive:
         raise AlignmentError(
@@ -1350,33 +2535,58 @@ def validate_chapter_pairs(book_a: Book, book_b: Book, pairs: list[dict]) -> lis
     skipped_b = book_b.skipped_by_href
 
     validated: list[dict] = []
+    seen_a: set[str] = set()
+    seen_b: set[str] = set()
     for index, pair in enumerate(pairs, start=1):
-        href_a = pair.get("a_href")
-        href_b = pair.get("b_href")
-        if href_a not in chapters_a:
+        normalized_pair = normalize_chapter_pair_entry(pair)
+        for href_a in normalized_pair["a_hrefs"]:
+            if href_a in seen_a:
+                raise AlignmentError(f"Config chapter in source A is paired twice: {href_a}")
+            seen_a.add(href_a)
+            if href_a in chapters_a:
+                continue
             if href_a in skipped_a:
                 raise AlignmentError(
                     f"Config chapter in source A was skipped as non-main content: "
                     f"{skipped_a[href_a].title}"
                 )
             raise AlignmentError(f"Config chapter not found in source A: {href_a}")
-        if href_b not in chapters_b:
+        for href_b in normalized_pair["b_hrefs"]:
+            if href_b in seen_b:
+                raise AlignmentError(f"Config chapter in source B is paired twice: {href_b}")
+            seen_b.add(href_b)
+            if href_b in chapters_b:
+                continue
             if href_b in skipped_b:
                 raise AlignmentError(
                     f"Config chapter in source B was skipped as non-main content: "
                     f"{skipped_b[href_b].title}"
                 )
             raise AlignmentError(f"Config chapter not found in source B: {href_b}")
-        chapter_a = chapters_a[href_a]
-        chapter_b = chapters_b[href_b]
+        grouped_a = [chapters_a[href] for href in normalized_pair["a_hrefs"]]
+        grouped_b = [chapters_b[href] for href in normalized_pair["b_hrefs"]]
         validated.append(
             {
-                "id": pair.get("id", f"chapter-{index:02d}"),
-                "a_href": href_a,
-                "b_href": href_b,
-                "title": pair.get("title")
-                or f"{chapter_a.title} / {chapter_b.title}",
-                "alignments": pair.get("alignments", []),
+                "id": normalized_pair.get("id") or f"chapter-{index:02d}",
+                "a_hrefs": normalized_pair["a_hrefs"],
+                "b_hrefs": normalized_pair["b_hrefs"],
+                "title": normalized_pair.get("title")
+                or f"{chapter_range_label(grouped_a)} / {chapter_range_label(grouped_b)}",
+                "alignments": normalized_pair.get("alignments", []),
+                **{
+                    key: value
+                    for key, value in pair.items()
+                    if key
+                    not in {
+                        "id",
+                        "a_href",
+                        "b_href",
+                        "a_hrefs",
+                        "b_hrefs",
+                        "title",
+                        "alignments",
+                    }
+                },
             }
         )
     return validated
@@ -1442,8 +2652,8 @@ def parse_chapter_pairs(raw: str, book_a: Book, book_b: Book) -> list[dict]:
         pairs.append(
             {
                 "id": f"chapter-{index:02d}",
-                "a_href": chapter_a.href,
-                "b_href": chapter_b.href,
+                "a_hrefs": [chapter_a.href],
+                "b_hrefs": [chapter_b.href],
                 "title": f"{chapter_a.title} / {chapter_b.title}",
             }
         )
@@ -1892,8 +3102,8 @@ def auto_alignment_is_confident(result: AutoAlignmentResult) -> bool:
 
 def write_review_file(
     pair: dict,
-    chapter_a: Chapter,
-    chapter_b: Chapter,
+    chapter_a: ChapterGroup,
+    chapter_b: ChapterGroup,
     work_dir: Path,
     label_a: str,
     label_b: str,
@@ -1998,8 +3208,8 @@ def write_review_file(
 
 def resolve_alignments(
     pair: dict,
-    chapter_a: Chapter,
-    chapter_b: Chapter,
+    chapter_a: ChapterGroup,
+    chapter_b: ChapterGroup,
     config: dict,
     config_path: Path,
     work_dir: Path,
@@ -2086,8 +3296,8 @@ def resolve_alignments(
 def build_merged_chapter(
     index: int,
     pair: dict,
-    chapter_a: Chapter,
-    chapter_b: Chapter,
+    chapter_a: ChapterGroup,
+    chapter_b: ChapterGroup,
     alignments: list[dict],
 ) -> MergedChapter:
     segments: list[MergedSegment] = []
@@ -2489,8 +3699,11 @@ def merge_epubs(args: argparse.Namespace) -> int:
     chapter_pairs = resolve_chapter_pairs(
         book_a,
         book_b,
+        cleanup_rules,
         config,
         interactive=not args.non_interactive,
+        resolver_mode=args.chapter_resolver,
+        resolver_model=args.chapter_model,
     )
     save_config(args.config, config)
 
@@ -2504,8 +3717,8 @@ def merge_epubs(args: argparse.Namespace) -> int:
     chapters_b = book_b.chapters_by_href
 
     for position, pair in enumerate(chapter_pairs, start=1):
-        chapter_a = chapters_a[pair["a_href"]]
-        chapter_b = chapters_b[pair["b_href"]]
+        chapter_a = build_chapter_group(pair, "a", chapters_a)
+        chapter_b = build_chapter_group(pair, "b", chapters_b)
         alignments = resolve_alignments(
             pair,
             chapter_a,
@@ -2605,6 +3818,8 @@ def interactive_wizard() -> int:
         title="",
         max_auto_span=5,
         non_interactive=False,
+        chapter_resolver="auto",
+        chapter_model=default_chapter_resolver_model(),
     )
     return merge_epubs(args)
 
@@ -2721,11 +3936,30 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not prompt. Missing chapter pairs or alignments will raise an error.",
     )
+    merge_parser.add_argument(
+        "--chapter-resolver",
+        choices=("auto", "off", "llm"),
+        default="auto",
+        help=(
+            "Chapter-pair resolver mode. 'auto' uses the OpenAI resolver only when "
+            "OPENAI_API_KEY is configured; 'off' disables it; 'llm' requires it."
+        ),
+    )
+    merge_parser.add_argument(
+        "--chapter-model",
+        default=default_chapter_resolver_model(),
+        help=(
+            "Model used for semantic chapter mapping when the LLM resolver is enabled. "
+            f"Default: {default_chapter_resolver_model()}."
+        ),
+    )
     merge_parser.set_defaults(func=merge_epubs)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_env_file(Path.cwd() / ENV_FILE_NAME)
+    load_env_file(Path(__file__).resolve().with_name(ENV_FILE_NAME))
     parser = build_parser()
     args = parser.parse_args(argv)
     try:

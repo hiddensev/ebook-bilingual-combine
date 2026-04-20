@@ -18,6 +18,9 @@ classifiers = [
   "Operating System :: OS Independent"
 ]
 
+[project.optional-dependencies]
+semantic = ["openai>=2,<3"]
+
 [project.scripts]
 ebook-bilingual-combine = "combine_books:main"
 

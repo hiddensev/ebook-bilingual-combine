@@ -15,7 +15,8 @@ Supported outputs:
 - `.md`
 - `.txt`
 
-No third-party runtime dependencies are required.
+No third-party runtime dependencies are required for the local-only merge path.
+Semantic chapter mapping is optional and uses the OpenAI Python client.
 
 ## Install
 
@@ -135,6 +136,29 @@ directory into the current directory.
 
 You do not need to create a config file first for normal usage.
 
+## Optional Semantic Chapter Mapping
+
+If the two books do not have a clean `1:1` chapter structure, the tool can ask an
+OpenAI model to infer chapter groups such as `1:2` or `2:1`.
+
+1. Create a local `.env` file in the project root, next to `combine_books.py`.
+   You can copy `.env.example` and fill in your own key.
+   This file is local-only and should not be committed.
+2. Put your API key in it:
+
+```bash
+OPENAI_API_KEY=your_key_here
+```
+
+3. Install the optional dependency:
+
+```bash
+python3 -m pip install '.[semantic]'
+```
+
+After that, normal `merge` runs will use semantic chapter mapping automatically
+when no `chapter_pairs` are already stored in the config.
+
 ## What The Commands Mean
 
 `ebook-bilingual-combine`
@@ -199,12 +223,14 @@ ebook-bilingual-combine merge \
 - trims likely trailing afterword / translator material appended to the end of chapters
 - separates obvious trailing note blocks at chapter ends, such as a final `注释` heading followed by bracketed note paragraphs
 - keeps those trailing notes in the final output, but excludes them from paragraph matching
-- shows both full chapter lists and asks you for the start and end chapter anchors
+- if `OPENAI_API_KEY` is configured, can infer chapter-level mappings from chapter titles plus opening / closing excerpts
+- otherwise shows both full chapter lists and asks you for the start and end chapter anchors
 - if counts still differ, tries local paragraph-block alignment by length signals and automatically adopts the suggested paragraph ranges
 - stores chapter pairings and paragraph alignments in a JSON config file
 
-The tool does not try to guess where the main text begins or ends. Instead, it
-shows both chapter lists and asks you for chapter-pair anchors.
+Without semantic mapping enabled, the tool does not try to guess where the main
+text begins or ends. Instead, it shows both chapter lists and asks you for
+chapter-pair anchors.
 
 You do not need to enter every pair one by one. You can enter just the start
 and end anchors of a continuous aligned block.
